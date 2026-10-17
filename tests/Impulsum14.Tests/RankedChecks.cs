@@ -199,7 +199,13 @@ internal static class RankedChecks
         {
             first = last = service.BindMatch(1, 2).Id;
             service.Report(1, first, 1, 1);
-            oldJournal = File.ReadAllBytes(Path.Combine(directory, "ranked", "journal.bin"));
+            // The service keeps its writer open. On Windows even a read handle must
+            // explicitly share that existing write access; do not relax the writer lock.
+            using (var snapshot = new FileStream(Path.Combine(directory, "ranked", "journal.bin"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                oldJournal = new byte[checked((int)snapshot.Length)];
+                snapshot.ReadExactly(oldJournal);
+            }
             service.Report(2, first, 1, 1); // checkpoint includes all three events
         }
         // Crash immediately after replacing the checkpoint but before truncating
