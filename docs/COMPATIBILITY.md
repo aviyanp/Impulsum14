@@ -15,6 +15,7 @@ The implementation is reviewable and deployable as a backend. It is not a claim 
 
 | Area | Status |
 |---|---|
+| Backend build, regression suite and publish | [Linux and Windows CI](https://github.com/aviyanp/Impulsum14/actions/runs/39031094676): 83/83 checks and Release publish on both platforms; not a retail executable test |
 | HTTP keepalive, chunked bodies, method overrides | Exercised using live Kestrel sockets |
 | Blaze login/session notifications/settings | Exercised using real Fire/Heat2 sockets |
 | Offline GameReporting completion | Terminal ResultNotification tested; wallet settlement remains exclusively `/match/end` |
