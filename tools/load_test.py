@@ -60,6 +60,25 @@ async def benchmark(args, base, tokens):
                 if r.status != 200:
                     raise RuntimeError("Fixture club creation failed")
         routes = ["user/credits", "club?count=21", "user/credits", "transfermarket?num=21&type=player", "squad/list", "user/credits", "club?count=21", "user/credits", "squad/active", "user/credits"]
+        if args.filtered_market:
+            routes[3] += "&lev=gold&minRating=75"
+        if args.active_listings:
+            # Keep one intentionally overpriced, long-lived private auction per
+            # account. This measures ordinary reads while market state exists,
+            # including unchanged maintenance, without waiting for real expiry.
+            for h in headers:
+                async with session.get(base + "/fut/rs4/ut/game/fifa14/club?count=500", headers=h) as r:
+                    r.raise_for_status()
+                    owned = (await r.json())["itemData"]
+                if not owned:
+                    raise RuntimeError("Fixture club has no player to list")
+                async with session.post(base + "/fut/rs4/ut/game/fifa14/auctionhouse", headers=h,
+                                        json={"itemData": {"id": owned[-1]["id"]}, "startingBid": 15000000,
+                                              "buyNowPrice": 15000000, "duration": 7200}) as r:
+                    r.raise_for_status()
+                    listing = await r.json()
+                    if not isinstance(listing.get("id"), int) or listing["id"] <= 0:
+                        raise RuntimeError("Fixture auction creation failed")
         async def request(i, n, measured):
             nonlocal errors
             path = "/fut/rs4/ut/game/fifa14/" + routes[n % len(routes)]
@@ -114,10 +133,14 @@ def main():
     parser.add_argument("--tick", type=int, choices=(30, 60), default=60)
     parser.add_argument("--duration", type=int, default=10)
     parser.add_argument("--mixed", action="store_true")
+    parser.add_argument("--filtered-market", action="store_true", help="Use native gold/minRating filters on the market read")
+    parser.add_argument("--active-listings", action="store_true", help="Seed one idle auction per disposable account (requires --launch)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 1 <= args.clients <= 2000 or not 1 <= args.duration <= 120:
         parser.error("clients must be 1..2000, duration 1..120")
+    if args.active_listings and not args.launch:
+        parser.error("--active-listings requires a disposable --launch instance")
     with tempfile.TemporaryDirectory(prefix="impulsum-bench-") as directory:
         root = Path(directory)
         process = None
@@ -157,7 +180,10 @@ def main():
             log.close()
             server_log_tail = (root / "server.log").read_text()[-2500:]
         usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        result["filtered_market"] = args.filtered_market
+        result["idle_listing_per_account"] = args.active_listings
         if process:
+            result["server_assembly_sha256"] = hashlib.sha256(args.launch.read_bytes()).hexdigest()
             result["server_cpu_seconds_including_startup"] = round(usage_after.ru_utime + usage_after.ru_stime - usage_before.ru_utime - usage_before.ru_stime, 3)
             result["child_max_rss_mb"] = round(usage_after.ru_maxrss / 1024, 1)
             result["server_exit_code"] = process.returncode
@@ -166,6 +192,8 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result, indent=2))
+        if result["errors"] or (process and process.returncode != 0):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

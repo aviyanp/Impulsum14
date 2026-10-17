@@ -1,0 +1,27 @@
+{
+  "clients": 100,
+  "requested_hz_per_client": 60,
+  "server_scheduler_hz": 60,
+  "duration_target_seconds": 30,
+  "elapsed_seconds": 30.006,
+  "requests": 180000,
+  "responses_per_second": 5998.7,
+  "errors": 0,
+  "statuses": {
+    "200": 180000
+  },
+  "latency_ms": {
+    "p50": 0.323,
+    "p95": 8.965,
+    "p99": 21.142,
+    "max": 59.12
+  },
+  "schedule_lag_p99_ms": 21.827,
+  "deadline_misses_including_schedule_lag": 8297,
+  "server_gc_heap_bytes": 60842800,
+  "mix": "representative starter-club reads, 5% durable writes",
+  "scope": "HTTP FUT backend only; same-host generator; warm caches; no FIFA executable or gameplay",
+  "server_cpu_seconds_including_startup": 41.413,
+  "child_max_rss_mb": 204.6,
+  "server_exit_code": 0
+}

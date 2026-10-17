@@ -15,7 +15,7 @@ The implementation is reviewable and deployable as a backend. It is not a claim 
 
 | Area | Status |
 |---|---|
-| Backend build, regression suite and publish | [Linux and Windows CI](https://github.com/aviyanp/Impulsum14/actions/runs/39031094676): 83/83 checks and Release publish on both platforms; not a retail executable test |
+| Backend build, regression suite and publish | [Linux and Windows CI](https://github.com/aviyanp/Impulsum14/actions/runs/39054089857): 116/116 checks and Release publish on both platforms; not a retail executable test |
 | HTTP keepalive, chunked bodies, method overrides | Exercised using live Kestrel sockets |
 | Blaze login/session notifications/settings | Exercised using real Fire/Heat2 sockets |
 | Offline GameReporting completion | Terminal ResultNotification tested; wallet settlement remains exclusively `/match/end` |
@@ -27,6 +27,10 @@ The implementation is reviewable and deployable as a backend. It is not a claim 
 | Native ranked match end | Bounded asynchronous peer-settlement wait, pending-result flag and refreshed settled receipt; exact retail post-match UI acceptance remains unverified |
 | Peer gameplay | Experimental: no FIFA-vs-FIFA match run, UDP relay, QoS probe server, NAT service, host migration or gameplay physics |
 | Synthetic market | Per-account bot market; bounded windows, bid timing/escrow/purchases persisted |
+| Market card fidelity | Cached immutable filters/history preserve exact player variants and live current-bid bounds; manager purchases retain advertised contracts/league, and league searches use the displayed modified league |
+| Native consumables | Exact owned copy consumed once on an eligible target; source positions, player/GK training, squad fitness and manager contracts checked; ineffective/unsupported applications preserve the card and its recovery receipt |
+| Match participation | Starting XI, roster and manager stay bound across squad-menu changes; repeated Ready/end requests preserve participants and spend contracts once. Unused native bench rows do not spend contracts. Optional per-item `secondsPlayed`/`minutesPlayed` explicitly identify played substitutes; these input extensions are not a retail capture claim |
+| Delayed trade offers | Ownership, listing state and funds rechecked at settlement; invalid offers award nothing. Completed exchanges clear old squad, modifier and duplicate-recovery references |
 | Shared human transfer market | Not implemented; account-private bot auctions must not be presented as a global player economy |
 | Manager task API | GET `/managertasks` or `/manager/tasks`; POST/PUT `/<id>` or `/reward` claims only server-observed progress |
 | Native manager quest state | GET/PUT/POST `/managerquest`: `entries` with integer `key` 0, 1, 2 and signed integer `value`; persisted per account, never used as reward authority |
