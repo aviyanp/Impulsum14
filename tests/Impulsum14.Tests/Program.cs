@@ -1,4 +1,3 @@
-using System.Security.Cryptography.X509Certificates;
 using ProtoFire.Tls;
 using PlayerState = Impulsum14.PlayerState;
 using HttpMethod = System.Net.Http.HttpMethod;
@@ -215,9 +214,9 @@ router.AddComponent<GameReportingComponent>();
 router.AddComponent(new GameManagerComponent(ranked));
 var blaze = new BlazeServer(new BlazeServerConfig { LocalEndpoint = new IPEndPoint(IPAddress.Loopback, options.BlazePort), Router = router, CallbackHandler = new ServerCallbacks(null!, NullLogger.Instance), CommandMiddleware = repo.RunRpcAsync }, NullLogger<BlazeServer>.Instance);
 Task blazeTask = blaze.StartAsync(stop.Token);
-using var testCertificate = new X509Certificate2(Path.Combine(AppContext.BaseDirectory, "certs/server.pfx"), (string?)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.EphemeralKeySet);
+var testCertificate = ProtoSSLCertificate.FromPkcs12File(Path.Combine(AppContext.BaseDirectory, "certs/server.pfx"));
 var redirectorRouter = new BlazeRouter(); redirectorRouter.AddComponent(new RedirectorComponent(options.BlazePort, NullLogger.Instance));
-var redirector = new BlazeServer(new BlazeServerConfig { LocalEndpoint = new IPEndPoint(IPAddress.Loopback, options.RedirectorPort), Secure = true, Router = redirectorRouter, CallbackHandler = new ServerCallbacks(ProtoSSLCertificate.FromX509Certificate2(testCertificate), NullLogger.Instance) }, NullLogger<BlazeServer>.Instance);
+var redirector = new BlazeServer(new BlazeServerConfig { LocalEndpoint = new IPEndPoint(IPAddress.Loopback, options.RedirectorPort), Secure = true, Router = redirectorRouter, CallbackHandler = new ServerCallbacks(testCertificate, NullLogger.Instance) }, NullLogger<BlazeServer>.Instance);
 Task redirectorTask = redirector.StartAsync(stop.Token);
 Task server = new WebServer(options.WebPort, NullLogger.Instance).StartAsync(stop.Token);
 using var http = new HttpClient { BaseAddress = new Uri(options.PublicWebUrl), Timeout = TimeSpan.FromSeconds(20) };

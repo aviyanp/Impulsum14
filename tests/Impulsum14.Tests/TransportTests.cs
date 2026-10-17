@@ -9,11 +9,15 @@ using Microsoft.Extensions.Logging.Abstractions;
 using ProtoFire;
 using ProtoFire.Frames;
 using ProtoFire.Tls;
+using Org.BouncyCastle.Pkcs;
+using Org.BouncyCastle.Security;
+using System.Security.Cryptography;
 
 internal static class TransportTests
 {
     internal static void Register(Action<string, Func<Task>> test)
     {
+        test("Portable PFX loading preserves the TLS identity and rejects invalid key stores", PortableCertificate);
         test("Fragmented Fire/Fire2 frames preserve jumbo contexts and metadata", FragmentedFrames);
         test("Cancelled packet reads terminate the underlying read", CancelledRead);
         test("Heat2 rejects corrupt integers, maps, variables and excessive nesting", HostileHeat2);
@@ -28,6 +32,41 @@ internal static class TransportTests
     private static void Check(bool condition, string message)
     {
         if (!condition) throw new Exception(message);
+    }
+
+    private static Task PortableCertificate()
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "certs/server.pfx");
+        using var input = File.OpenRead(path);
+        var certificate = ProtoSSLCertificate.FromPkcs12(input);
+        Check(input.CanRead && certificate.PrivateKey.IsPrivate, "Loader closed the caller's stream or lost its private key.");
+        string fingerprint = Convert.ToHexString(SHA256.HashData(certificate.Certificate.GetCertificateAt(0).GetEncoded()));
+        Check(fingerprint == "E40AB538E8D742D0F51D67AADC21A7ED61F52ADBCDDE772BFEB9D3376F3EB73D", "Legacy TLS leaf identity changed.");
+        void Reject(Action load)
+        {
+            bool failed = false;
+            try { load(); }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentException or Org.BouncyCastle.Security.GeneralSecurityException) { failed = true; }
+            Check(failed, "Invalid PFX was accepted.");
+        }
+        Reject(() => ProtoSSLCertificate.FromPkcs12File(path, "not-the-password"));
+        Reject(() => ProtoSSLCertificate.FromPkcs12(new MemoryStream(new byte[] { 1, 2, 3 })));
+
+        var original = new Pkcs12StoreBuilder().Build();
+        input.Position = 0; original.Load(input, []);
+        string alias = original.Aliases.Single(original.IsKeyEntry);
+        var noKey = new Pkcs12StoreBuilder().Build();
+        noKey.SetCertificateEntry("public-only", original.GetCertificate(alias));
+        var ambiguous = new Pkcs12StoreBuilder().Build();
+        ambiguous.SetKeyEntry("one", original.GetKey(alias), original.GetCertificateChain(alias));
+        ambiguous.SetKeyEntry("two", original.GetKey(alias), original.GetCertificateChain(alias));
+        foreach (var invalid in new[] { noKey, ambiguous })
+        {
+            using var encoded = new MemoryStream();
+            invalid.Save(encoded, [], new SecureRandom()); encoded.Position = 0;
+            Reject(() => ProtoSSLCertificate.FromPkcs12(encoded));
+        }
+        return Task.CompletedTask;
     }
 
     private static async Task FragmentedFrames()

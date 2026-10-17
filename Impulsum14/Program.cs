@@ -2,7 +2,6 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using Blaze.Core;
 using EATDF.Serialization;
 using Microsoft.Extensions.Logging;
@@ -32,8 +31,7 @@ internal static class Program
             using var repository = new PlayerRepository();
             using var ranked = new RankedService(options.DataDirectory, options.Ranked);
             RankedService.Current = ranked;
-            using var cert = new X509Certificate2(options.CertificatePath, Environment.GetEnvironmentVariable("FIFA14_CERTIFICATE_PASSWORD"), X509KeyStorageFlags.Exportable | X509KeyStorageFlags.EphemeralKeySet);
-            var protoCert = ProtoSSLCertificate.FromX509Certificate2(cert);
+            var protoCert = ProtoSSLCertificate.FromPkcs12File(options.CertificatePath, Environment.GetEnvironmentVariable("FIFA14_CERTIFICATE_PASSWORD"));
             var callbacks = new ServerCallbacks(protoCert, loggerFactory.CreateLogger("Blaze"));
             var encoding = Environment.GetEnvironmentVariable("FIFA14_FIRE2") == "1" ? FrameEncoding.Fire2 : FrameEncoding.Fire;
             TdfSerializer serializer = Environment.GetEnvironmentVariable("FIFA14_HEAT1") == "1" ? new HeatSerializer() : new Heat2Serializer();
@@ -93,8 +91,7 @@ internal static class Program
         string upstreamBlaze = Environment.GetEnvironmentVariable("FIFA14_UPSTREAM_BLAZE_HOST") ?? new Uri(upstreamWeb).Host;
         int upstreamPort = int.TryParse(Environment.GetEnvironmentVariable("FIFA14_UPSTREAM_BLAZE_PORT"), out int p) ? p : 10000;
         var bridge = new ClientBridge(options, upstreamWeb, upstreamBlaze, upstreamPort, token);
-        using var cert = new X509Certificate2(options.CertificatePath, Environment.GetEnvironmentVariable("FIFA14_CERTIFICATE_PASSWORD"), X509KeyStorageFlags.Exportable | X509KeyStorageFlags.EphemeralKeySet);
-        var proto = ProtoSSLCertificate.FromX509Certificate2(cert);
+        var proto = ProtoSSLCertificate.FromPkcs12File(options.CertificatePath, Environment.GetEnvironmentVariable("FIFA14_CERTIFICATE_PASSWORD"));
         var router = new BlazeRouter(); router.AddComponent(new RedirectorComponent(options.BlazePort, logging.CreateLogger("Redirector")));
         var redirector = new BlazeServer(new BlazeServerConfig { LocalEndpoint = new IPEndPoint(IPAddress.Parse(options.BindAddress), options.RedirectorPort), Router = router, Secure = true, CallbackHandler = new ServerCallbacks(proto, logging.CreateLogger("Bridge")), MaxConnections = 64 }, logging.CreateLogger<BlazeServer>());
         using var stop = new CancellationTokenSource();

@@ -1,4 +1,6 @@
 ﻿using Org.BouncyCastle.Crypto;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.Tls;
 using Org.BouncyCastle.Tls.Crypto;
@@ -40,6 +42,44 @@ public class ProtoSSLCertificate
     }
 
     public static ProtoSSLCertificate FromX509Certificate2(X509Certificate2 certificate) => new ProtoSSLCertificate(certificate);
+
+    /// <summary>
+    /// Loads the legacy redirector identity without importing its private key into an OS key
+    /// store. Windows CNG cannot export some legacy PFX keys, even with Exportable set.
+    /// The caller retains ownership of <paramref name="input"/>.
+    /// </summary>
+    public static ProtoSSLCertificate FromPkcs12(Stream input, string? password = null)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        var store = new Pkcs12StoreBuilder().Build();
+        char[] passwordChars = password?.ToCharArray() ?? [];
+        try { store.Load(input, passwordChars); }
+        finally { Array.Clear(passwordChars); }
+
+        string[] aliases = store.Aliases.Where(store.IsKeyEntry).Take(2).ToArray();
+        if (aliases.Length != 1)
+            throw new InvalidDataException("Redirector PFX must contain exactly one private key.");
+        var key = store.GetKey(aliases[0]).Key;
+        var entries = store.GetCertificateChain(aliases[0]);
+        if (key is not RsaPrivateCrtKeyParameters rsa || entries == null || entries.Length == 0)
+            throw new InvalidDataException("Redirector PFX requires an RSA private key and certificate chain.");
+        if (entries[0].Certificate.GetPublicKey() is not RsaKeyParameters leaf ||
+            !rsa.Modulus.Equals(leaf.Modulus) || !rsa.PublicExponent.Equals(leaf.Exponent))
+            throw new InvalidDataException("Redirector certificate does not match its private key.");
+
+        // PKCS#12 returns the leaf first. Keep that order and the exact legacy identity;
+        // modern OS trust/expiry policies are not the retail client's TLS policy.
+        var crypto = new BcTlsCrypto(new SecureRandom());
+        TlsCertificate[] chain = entries.Select(entry =>
+            (TlsCertificate)new BcTlsCertificate(crypto, entry.Certificate.CertificateStructure)).ToArray();
+        return new ProtoSSLCertificate(key, new Certificate(chain));
+    }
+
+    public static ProtoSSLCertificate FromPkcs12File(string path, string? password = null)
+    {
+        using var input = File.OpenRead(path);
+        return FromPkcs12(input, password);
+    }
 
     public X509Certificate2? AsX509Certificate2() => X509Certificate;
 

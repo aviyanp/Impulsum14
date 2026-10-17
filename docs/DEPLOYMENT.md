@@ -20,6 +20,8 @@ Defaults → JSON (`FIFA14_CONFIG`, otherwise `server.json` beside the executabl
 
 All other options are configured in JSON. Repeated eligible GET responses are cached per account only within the current Unix second, keyed to the committed revision and session. `ResponseCacheBytes` (default 131072, body bytes) and `ResponseCacheEntries` (default 8) bound this cache; set either to zero to disable it. Wallet/inventory commits invalidate cached reads immediately. `FIFA14_CERTIFICATE_PASSWORD` supplies an optional PFX password. Legacy `FIFA14_FIRE2=1` and `FIFA14_HEAT1=1` remain available for diagnostics; FIFA 14 PC and the bridge use the default Fire/Heat2 combination.
 
+The redirector and PC bridge parse their PFX directly with Bouncy Castle, without importing private keys into the Windows key store or relying on CNG export support. Supply a MAC-protected PKCS#12 file containing exactly one RSA private key and its matching leaf-first certificate chain; the bundled empty-password identity is supported. Wrong passwords, missing/ambiguous keys and mismatched certificates fail startup. Preserve the identity required by your client setup: a different certificate is not automatically trusted by the retail executable. This legacy TLS identity is separate from production HTTPS termination.
+
 `BindAddress` selects the network interface. `AdvertisedAddress` is the reachable IPv4 address returned by the legacy redirector; never use `0.0.0.0` there. `PublicWebUrl` is the externally reachable HTTP(S) origin, including its port. The game cannot connect to a container-only address. Port mappings must agree with advertised values.
 
 ## Peer lobbies and ranked policy
