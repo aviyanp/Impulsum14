@@ -20,6 +20,7 @@ internal sealed class MatchSession
     public int TournamentRound { get; set; }
     public int SeasonInstanceId { get; set; }
     public int SquadId { get; set; }
+    public long ManagerId { get; set; }
     public List<long> StartingXiIds { get; set; } = new();
     public List<long> RosterIds { get; set; } = new();
     public bool Ready { get; set; }
@@ -51,8 +52,11 @@ internal static class MatchService
             RefreshRankedReceipt(previous, receipt);
         }
         int tournament = Integer(root, "tournamentId", 0, 0, int.MaxValue);
-        if (tournament == 0 && data.LastCompetition == "tournament") tournament = data.ActiveTournamentId;
         var ranked = RankedService.Current?.GetActive(PlayerContext.Current.Id);
+        // Browsing an offline cup leaves a presentation hint. A subsequent
+        // server-bound online game takes precedence over that stale hint;
+        // explicitly requesting a cup still conflicts with the paired game.
+        if (ranked is null && tournament == 0 && data.LastCompetition == "tournament") tournament = data.ActiveTournamentId;
         if (ranked is not null && (ranked.PlayerA == PlayerContext.Current.Id ? ranked.ReportedA : ranked.ReportedB))
             throw new BadHttpRequestException("This ranked score has already been submitted.", 409);
         bool requestedOnline = Text(root, "type", 32).Equals("online", StringComparison.OrdinalIgnoreCase);
@@ -63,14 +67,16 @@ internal static class MatchService
         int div = online ? data.Profile.OnlineDivision : data.Profile.OfflineDivision;
         var season = online ? data.Profile.OnlineSeason : data.Profile.Season;
         int squadId = Integer(root, "squadId", data.Club.ActiveSquadId, 0, int.MaxValue);
-        var squad = data.Club.Squads.FirstOrDefault(s => s.Id == squadId) ?? data.Club.Squads.FirstOrDefault();
+        var squad = data.Club.Squads.FirstOrDefault(s => s.Id == squadId);
+        if (squad is null && root.TryGetProperty("squadId", out _)) throw new BadHttpRequestException("The selected squad does not exist.", 409);
+        squad ??= data.Club.Squads.FirstOrDefault();
         PlayerContext.MarkDirty();
         var run = tournament > 0 ? Tournaments.BeginMatch(tournament) : (RunId: 0L, Round: 0);
         var match = new MatchSession
         {
             Id = checked(++data.NextMatchId), CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), RequestHash = hash,
             TournamentId = tournament, TournamentRunId = run.RunId, TournamentRound = run.Round, SeasonInstanceId = season.SeasonId,
-            Competition = competition, Online = online, RankedMatchId = ranked?.Id ?? 0, SquadId = squad?.Id ?? squadId,
+            Competition = competition, Online = online, RankedMatchId = ranked?.Id ?? 0, SquadId = squad?.Id ?? squadId, ManagerId = squad?.ManagerId ?? 0,
             StartingXiIds = squad?.Slots.Where(s => s.Key is >= 0 and < 11 && s.Value > 0).OrderBy(s => s.Key).Select(s => s.Value).Distinct().ToList() ?? new(),
             RosterIds = squad?.Slots.Where(s => s.Key is >= 0 and < 23 && s.Value > 0).Select(s => s.Value).Distinct().ToList() ?? new(),
             Difficulty = tournament > 0 ? Tournaments.Defs.First(d => d.Id == tournament).Diff : competition == "season" ? Seasons.Difficulty(div, season.GamesPlayed + 1) : 3
@@ -91,20 +97,36 @@ internal static class MatchService
         if (root.TryGetProperty("items", out var items))
         {
             if (items.ValueKind != JsonValueKind.Array || items.GetArrayLength() > 11) throw new BadHttpRequestException("MatchReady accepts at most eleven starters.", 400);
-            var owned = data.Club.Inventory.ToDictionary(p => p.ItemId);
             foreach (var item in items.EnumerateArray())
             {
                 if (item.ValueKind != JsonValueKind.Object) throw new InvalidDataException("Invalid match item.");
                 long id = item.TryGetProperty("id", out _) ? Long(item, "id") : Long(item, "itemId");
-                if (!owned.TryGetValue(id, out var card) || card.Pile is 0 or 3 || ids.Contains(id)) throw new BadHttpRequestException("Invalid starting player.", 409);
+                if (!match.RosterIds.Contains(id) || ids.Contains(id)) throw new BadHttpRequestException("Invalid starting player.", 409);
                 ids.Add(id);
             }
         }
         if (ids.Count == 0) ids = match.StartingXiIds.ToList();
-        if (match.Ready && !match.StartingXiIds.SequenceEqual(ids)) throw new BadHttpRequestException("MatchReady starters are already bound.", 409);
+        if (match.Ready)
+        {
+            // Ready identifies participants, not formation slots. Retrying the
+            // same XI in another order must not rewrite or reject a bound game.
+            if (ids.Count != match.StartingXiIds.Count || ids.Any(id => !match.StartingXiIds.Contains(id)))
+                throw new BadHttpRequestException("MatchReady starters are already bound.", 409);
+            return data.Club.Squads.FirstOrDefault(s => s.Id == match.SquadId) ?? new Squad { Id = match.SquadId };
+        }
+        // Validate even the implicit XI. Building an index of a potentially
+        // large club for eleven identifiers wastes memory on every Ready.
+        var selected = ids.ToHashSet();
+        int owned = 0;
+        foreach (var card in data.Club.Inventory)
+            if (selected.Contains(card.ItemId))
+            {
+                if (card.Pile is 0 or 3) throw new BadHttpRequestException("Invalid starting player.", 409);
+                owned++;
+            }
+        if (owned != ids.Count) throw new BadHttpRequestException("A starting player is no longer available.", 409);
         PlayerContext.MarkDirty();
         match.StartingXiIds = ids;
-        match.RosterIds = match.RosterIds.Union(ids).ToList();
         match.Ready = true;
         return data.Club.Squads.FirstOrDefault(s => s.Id == match.SquadId) ?? new Squad { Id = match.SquadId };
     }
@@ -211,7 +233,7 @@ internal static class MatchService
             ["completionAward"] = coins, ["skillAward"] = 0, ["totalAward"] = coins + prize, ["rewardCoins"] = coins, ["totalCoins"] = coins + prize,
             ["seasonCoins"] = match.Competition is "season" or "ranked" ? prize : 0, ["boostConis"] = 0, ["boostCountLeft"] = 0,
             ["participationAward"] = coins, ["matchCoinPartials"] = Array.Empty<object>(), ["matchCoinMultipliers"] = Array.Empty<object>(),
-            ["matchParamsKeyValues"] = new Dictionary<string, string>(), ["endReason"] = reason, ["secondsPlayed"] = seconds,
+            ["matchParamsKeyValues"] = new Dictionary<string, string>(), ["endReason"] = RankedReason(rankedReceipt, reason), ["secondsPlayed"] = seconds,
             ["matchDifficulty"] = match.Difficulty, ["items"] = itemStats, ["matchData"] = matchData, ["dnfModifier"] = abandoned ? 0 : 1,
             ["userData"] = new { credits = balance, coins = balance }, ["rankedMatchId"] = match.RankedMatchId,
             ["rankedReceiptStatus"] = match.RankedMatchId > 0 ? rankedReceipt?.Status ?? "retired" : "offline",
@@ -251,12 +273,23 @@ internal static class MatchService
         response["currencies"] = JsonSerializer.SerializeToNode(new[] { new { name = "COINS", funds = balance, finalFunds = balance } });
         response["userData"] = JsonSerializer.SerializeToNode(new { credits = balance, coins = balance });
         response["rankedReceiptStatus"] = receipt?.Status ?? "retired";
-        if (receipt is not null)
+        response["endReason"] = RankedReason(receipt, response["endReason"]?.GetValue<string>() ?? "NO_CONTEST");
+        if (receipt is { Settled: true })
         {
             response["elo"] = isA ? receipt.RatingAfterA : receipt.RatingAfterB;
             response["eloChange"] = isA ? receipt.RatingDeltaA : receipt.RatingDeltaB;
         }
         PlayerContext.MarkDirty(); match.RankedFinalized = true; match.Response = response.ToJsonString(); return match.Response;
+    }
+
+    private static string RankedReason(RankedMatchView? receipt, string reported)
+    {
+        if (receipt is { Cancelled: true }) return "NO_CONTEST";
+        if (receipt is not { Settled: true }) return reported;
+        if (receipt.ForfeitedBy == PlayerContext.Current.Id) return reported == "DNF" ? "DNF" : "QUIT";
+        bool isA = receipt.PlayerA == PlayerContext.Current.Id;
+        int comparison = (isA ? receipt.GoalsA!.Value : receipt.GoalsB!.Value).CompareTo(isA ? receipt.GoalsB!.Value : receipt.GoalsA!.Value);
+        return comparison > 0 ? "WIN" : comparison < 0 ? "LOSS" : "DRAW";
     }
 
     private static Dictionary<string, int> Stats(JsonElement root, string property)

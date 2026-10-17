@@ -17,6 +17,7 @@
   "MaxPageSize": 500,
   "ResponseCacheBytes": 131072,
   "ResponseCacheEntries": 8,
+  "ResponseCacheSeconds": 30,
   "RequestTimeoutSeconds": 30,
   "IdleTimeoutSeconds": 120,
   "SessionLifetimeMinutes": 720,

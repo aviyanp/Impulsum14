@@ -80,8 +80,34 @@ internal static class CompetitionSave
         data = Canonical(data); progress = Canonical(progress);
         // Length delimiters keep different pairs from producing the same input.
         // Canonical base64 also blocks whitespace-only re-encodings of retired blobs.
-        string text = round.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + data.Length + ":" + data + ":" + progress;
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+        // Keep the established byte format so persisted retired fingerprints
+        // remain valid. Stream its pieces rather than allocating another full
+        // pair of blob-sized string/UTF-8 buffers on every native autosave.
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        AppendUtf8(hash, round.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        hash.AppendData(":"u8);
+        // Match the original integer-to-string concatenation, including the
+        // current culture used for the canonical data's UTF-16 length.
+        AppendUtf8(hash, data.Length.ToString());
+        hash.AppendData(":"u8); AppendUtf8(hash, data);
+        hash.AppendData(":"u8); AppendUtf8(hash, progress);
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private static void AppendUtf8(IncrementalHash hash, ReadOnlySpan<char> text)
+    {
+        Span<byte> bytes = stackalloc byte[4096];
+        while (!text.IsEmpty)
+        {
+            // UTF-8 needs at most three bytes per UTF-16 code unit. Preserve a
+            // valid surrogate pair across chunks; malformed units retain the
+            // same replacement behavior as Encoding.UTF8.GetBytes(fullText).
+            int count = Math.Min(text.Length, bytes.Length / 3);
+            if (count < text.Length && char.IsHighSurrogate(text[count - 1]) && char.IsLowSurrogate(text[count])) count--;
+            int written = Encoding.UTF8.GetBytes(text[..count], bytes);
+            hash.AppendData(bytes[..written]);
+            text = text[count..];
+        }
     }
 
     internal static void Retire(List<string> hashes, string fingerprint)

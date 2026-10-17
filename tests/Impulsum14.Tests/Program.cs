@@ -444,7 +444,12 @@ Test("Metrics expose latency buckets", async () =>
 });
 
 FunctionalFlowTests.Register(Test, http, a, action => Run(a, action));
+ConsumablePolishChecks.Register(Test, http, a, action => Run(a, action));
+HttpPolishChecks.Register(Test, http, a, action => Run(a, action));
+MatchParticipationChecks.Register(Test, http, a, action => Run(a, action));
 CompetitionInvariantTests.Register(Test, repo, a);
+ProgressionPolishChecks.Register(Test, repo, a);
+MarketPolishChecks.Register(Test, a, b, Run);
 TransportTests.Register(Test);
 Test("Ranked pairing, corroboration, self-forfeit and ownership", () => { RankedChecks.PairingAndCorroboration(temp); return Task.CompletedTask; });
 Test("Ranked zero-sum Elo bounds and ten-game online seasons", () => { RankedChecks.EloBoundsAndSeasons(temp); return Task.CompletedTask; });

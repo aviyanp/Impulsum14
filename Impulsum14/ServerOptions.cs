@@ -24,6 +24,7 @@ internal sealed class ServerOptions
     public int MaxBodyBytes { get; set; } = 1024 * 1024;
     public int ResponseCacheBytes { get; set; } = 131072;
     public int ResponseCacheEntries { get; set; } = 8;
+    public int ResponseCacheSeconds { get; set; } = 30;
     public int MaxPageSize { get; set; } = 500;
     public int RequestsPerSecond { get; set; } = 120;
     public int SessionLifetimeMinutes { get; set; } = 720;
@@ -105,7 +106,7 @@ internal sealed class ServerOptions
         ValidateDivisionRules(OfflineDivisionRules); ValidateDivisionRules(OnlineDivisionRules);
         if (Ranked is null) throw new InvalidDataException("Ranked configuration cannot be null.");
         Ranked.Validate();
-        if (ResponseCacheBytes is < 0 or > 1048576 || ResponseCacheEntries is < 0 or > 64) throw new InvalidDataException("Invalid response cache limits.");
+        if (ResponseCacheBytes is < 0 or > 1048576 || ResponseCacheEntries is < 0 or > 64 || ResponseCacheSeconds is < 1 or > 300) throw new InvalidDataException("Invalid response cache limits.");
         if (MaxConnections is < 1 or > 100000 || MaxPlayers is < 1 or > 100000 || RequestsPerSecond is < 1 or > 10000 || MaxBodyBytes is < 1024 or > 16777216 || MaxPageSize is < 1 or > 2000 || MarketScanLimit is < 100 or > 500000 || MaintenanceIntervalMs is < 100 or > 60000 || SessionLifetimeMinutes is < 1 or > 10080 || RequestTimeoutSeconds is < 1 or > 300 || IdleTimeoutSeconds is < 5 or > 3600)
             throw new InvalidDataException("Server limits are outside their supported range.");
         if (MarketPlayers is < 1000 or > 5000000 || MarketConsumables is < 100 or > 5000000 || MarketClubItems is < 100 or > 5000000 || MarketStaff is < 100 or > 5000000) throw new InvalidDataException("Invalid synthetic market size.");

@@ -1,9 +1,109 @@
+using System.Collections.Concurrent;
+using System.Collections.Specialized;
 using System.Text;
 
 namespace Impulsum14;
 
 internal static class Market
 {
+    // Only deterministic catalogue calculations are shared. Account purchases,
+    // watches, escrow, bids and auction time are always evaluated by the caller.
+    private readonly record struct StartKey(byte Family, long Listing, long Cycle);
+    private const int StartCacheLimit = 8192;
+    private static readonly ConcurrentDictionary<StartKey, long> StartCache = new();
+    private static readonly Queue<StartKey> StartCacheOrder = new();
+    private static readonly object StartCacheGate = new();
+
+    private static long RememberStart(StartKey key, long value)
+    {
+        lock (StartCacheGate)
+        {
+            if (StartCache.TryGetValue(key, out long existing)) return existing;
+            while (StartCache.Count >= StartCacheLimit)
+                StartCache.TryRemove(StartCacheOrder.Dequeue(), out _);
+            StartCache[key] = value;
+            StartCacheOrder.Enqueue(key);
+            return value;
+        }
+    }
+
+    internal readonly record struct PlayerFilterKey(int MinimumRating, int MaximumRating,
+        int Nation, int League, int Team, int BaseDefinition, int Definition, int Level)
+    {
+        internal bool IsUnfiltered => MinimumRating < 0 && MaximumRating < 0 && Nation < 0
+            && League < 0 && Team < 0 && BaseDefinition < 0 && Definition < 0 && Level == 0;
+
+        internal bool Matches(RealPlayer card) =>
+            (MinimumRating < 0 || card.Rating >= MinimumRating)
+            && (MaximumRating < 0 || card.Rating <= MaximumRating)
+            && (Nation < 0 || card.NationId == Nation)
+            && (League < 0 || TeamLeagues.LeagueOf(card.TeamId) == League)
+            && (Team < 0 || card.TeamId == Team)
+            && (BaseDefinition < 0 || card.Id == BaseDefinition)
+            && (Definition < 0 || card.CardId == Definition)
+            && (Level == 0 || (Level == 1 ? card.Rating < 65
+                : Level == 2 ? card.Rating is >= 65 and < 75 : card.Rating >= 75));
+    }
+
+    internal static PlayerFilterKey ParsePlayerFilter(NameValueCollection query)
+    {
+        int Nonnegative(string name) => int.TryParse(query[name], out int value) && value >= 0 ? value : -1;
+        int Positive(string name) => int.TryParse(query[name], out int value) && value > 0 ? value : -1;
+        int masked = Positive("maskedDefId");
+        int level = (query["lev"] ?? "").ToLowerInvariant() switch { "bronze" => 1, "silver" => 2, "gold" => 3, _ => 0 };
+        return new(Nonnegative("minRating"), Nonnegative("maxRating"), Nonnegative("nat"),
+            Nonnegative("leag"), Nonnegative("team"), masked < 0 ? -1 : masked % SpecialCards.Band,
+            Positive("definitionId"), level);
+    }
+
+    private readonly record struct SelectionKey(byte Family, PlayerFilterKey Player = default,
+        string Category = "", string Level = "", string Position = "", string WireType = "",
+        int Style = 0, int Nation = 0, int League = 0, int Team = 0);
+    private sealed record SelectionView(int[] Indices, long[] Prefix, long Total, int HalfBits)
+    {
+        internal long Bytes => 64L + Indices.LongLength * sizeof(int) + Prefix.LongLength * sizeof(long);
+    }
+
+    private const int SelectionCacheLimit = 64;
+    private const long SelectionCacheByteLimit = 4 * 1024 * 1024;
+    private static readonly ConcurrentDictionary<SelectionKey, SelectionView> SelectionCache = new();
+    private static readonly Queue<SelectionKey> SelectionCacheOrder = new();
+    private static readonly object SelectionCacheGate = new();
+    private static long SelectionCacheBytes;
+
+    private static SelectionView CreateSelection(int[] counts, Func<int, bool> matches)
+    {
+        var selected = new List<int>();
+        for (int i = 0; i < counts.Length; i++) if (matches(i)) selected.Add(i);
+        var prefix = new long[selected.Count + 1];
+        long total = 0;
+        for (int i = 0; i < selected.Count; i++) prefix[i + 1] = total += counts[selected[i]];
+        return new(selected.ToArray(), prefix, total, HalfBitsFor(total));
+    }
+
+    private static SelectionView RememberSelection(SelectionKey key, SelectionView view)
+    {
+        // Avoid retaining oversized untrusted query text, even for an empty view.
+        int textLength = key.Category.Length + key.Level.Length + key.Position.Length + key.WireType.Length;
+        long bytes = view.Bytes + textLength * sizeof(char);
+        if (textLength > 512 || bytes > SelectionCacheByteLimit) return view;
+        lock (SelectionCacheGate)
+        {
+            if (SelectionCache.TryGetValue(key, out var existing)) return existing;
+            while (SelectionCache.Count >= SelectionCacheLimit || SelectionCacheBytes + bytes > SelectionCacheByteLimit)
+            {
+                var oldest = SelectionCacheOrder.Dequeue();
+                if (SelectionCache.TryRemove(oldest, out var removed))
+                    SelectionCacheBytes -= removed.Bytes + (oldest.Category.Length + oldest.Level.Length
+                        + oldest.Position.Length + oldest.WireType.Length) * sizeof(char);
+            }
+            SelectionCache[key] = view;
+            SelectionCacheOrder.Enqueue(key);
+            SelectionCacheBytes += bytes;
+            return view;
+        }
+    }
+
     private static readonly RealPlayer[] Cards;  
     private static readonly int[] Counts;   
     private static readonly long[] Prefix;  
@@ -385,18 +485,27 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
     private static long EffStart(RealPlayer card, long g, long k, long dur, int s0, int buy)
     {
         if (k <= 0) return s0;
+        var key = new StartKey(0, g, k);
+        return StartCache.TryGetValue(key, out long value) ? value
+            : RememberStart(key, EffStartUncached(card, g, k, dur, s0, buy));
+    }
+
+    private static long EffStartUncached(RealPlayer card, long g, long k, long dur, int s0, int buy)
+    {
+        if (k <= 0) return s0;
         const int Window = 40;
         long k0 = Math.Max(0, k - Window);
         long eff = s0, prevEff = 0;
+        var (previousStart, previousBuy) = Price(card, g, k0);
         for (long kk = k0 + 1; kk <= k; kk++)
         {
             var (sp, bp) = Price(card, g, kk);             // rolled start/buy of this cycle
-            var (spp, bpp) = Price(card, g, kk - 1);       // previous cycle
-            long sPrevOp = (kk - 1 > k0) ? prevEff : spp;
-            var (hasBids, _, _, finalP) = SimBids(card, g, kk - 1, dur, (int)sPrevOp, (int)bpp, dur);
-            eff = (hasBids && finalP < bpp) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
+            long sPrevOp = (kk - 1 > k0) ? prevEff : previousStart;
+            var (hasBids, _, _, finalP) = SimBids(card, g, kk - 1, dur, (int)sPrevOp, previousBuy, dur);
+            eff = (hasBids && finalP < previousBuy) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
             if (eff > bp - Step(bp)) eff = Math.Max(sp, (long)bp - Step(bp));
             prevEff = eff;
+            previousBuy = bp;
         }
         return eff;
     }
@@ -466,19 +575,28 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
     private static long CEffStart(long cg, long k, long dur, int s0, int buy)
     {
         if (k <= 0) return s0;
+        var key = new StartKey(1, cg, k);
+        return StartCache.TryGetValue(key, out long value) ? value
+            : RememberStart(key, CEffStartUncached(cg, k, dur, s0, buy));
+    }
+
+    private static long CEffStartUncached(long cg, long k, long dur, int s0, int buy)
+    {
+        if (k <= 0) return s0;
         const int Window = 40;
         long k0 = Math.Max(0, k - Window);
         int tier = CTier[LocateIn(CPrefix, cg)];
         long eff = s0, prevEff = 0;
+        var (previousStart, previousBuy) = CPrice(cg, k0);
         for (long kk = k0 + 1; kk <= k; kk++)
         {
             var (sp, bp) = CPrice(cg, kk);
-            var (spp, bpp) = CPrice(cg, kk - 1);
-            long sPrevOp = (kk - 1 > k0) ? prevEff : spp;
-            var (hasBids, _, _, finalP) = CSimBids(tier, cg, kk - 1, dur, (int)sPrevOp, (int)bpp, dur);
-            eff = (hasBids && finalP < bpp) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
+            long sPrevOp = (kk - 1 > k0) ? prevEff : previousStart;
+            var (hasBids, _, _, finalP) = CSimBids(tier, cg, kk - 1, dur, (int)sPrevOp, previousBuy, dur);
+            eff = (hasBids && finalP < previousBuy) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
             if (eff > bp - Step(bp)) eff = Math.Max(sp, (long)bp - Step(bp));
             prevEff = eff;
+            previousBuy = bp;
         }
         return eff;
     }
@@ -536,7 +654,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
 
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
-        var rnd = new Random();
+        var rnd = Random.Shared;
         var sb = new StringBuilder("[");
         int written = 0;
         uint key = MarketKey; long scanFrom = start;
@@ -557,16 +675,17 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
             if (!t.StartsWith("TrainingPlayerPos", StringComparison.OrdinalIgnoreCase)) return false;
             return (CCards[i].Name ?? "").Contains(wantPos, StringComparison.OrdinalIgnoreCase);
         }
-        var mc = new List<int>();
-        for (int i = 0; i < CCards.Length; i++)
-            if (ConsumableCatMatches(CCards[i].ItemType, cat, wireType) && TierOk(i) && StyleOk(i) && PosOk(i)) mc.Add(i);
-        if (mc.Count > 0)
+        var viewKey = new SelectionKey(1, Category: cat ?? "", Level: lev ?? "", Position: wantPos,
+            WireType: wireType ?? "", Style: playStyle);
+        if (!SelectionCache.TryGetValue(viewKey, out var view))
+            view = RememberSelection(viewKey, CreateSelection(CCounts,
+                i => ConsumableCatMatches(CCards[i].ItemType, cat, wireType) && TierOk(i) && StyleOk(i) && PosOk(i)));
+        var mc = view.Indices;
+        if (mc.Length > 0)
         {
-            var vPrefix = new long[mc.Count + 1];
-            long acc = 0;
-            for (int k = 0; k < mc.Count; k++) { acc += CCounts[mc[k]]; vPrefix[k + 1] = acc; }
-            long vTotal = acc;
-            int vHalf = HalfBitsFor(vTotal);
+            var vPrefix = view.Prefix;
+            long vTotal = view.Total;
+            int vHalf = view.HalfBits;
             long scanCap = Math.Min(winStart + block, vTotal);   // stay inside the view -> no repeats
             for (long p = winStart; written < num && p < scanCap; p++)
             {
@@ -747,19 +866,28 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
     private static long EEffStart(long eg, long k, long dur, int s0, int buy)
     {
         if (k <= 0) return s0;
+        var key = new StartKey(2, eg, k);
+        return StartCache.TryGetValue(key, out long value) ? value
+            : RememberStart(key, EEffStartUncached(eg, k, dur, s0, buy));
+    }
+
+    private static long EEffStartUncached(long eg, long k, long dur, int s0, int buy)
+    {
+        if (k <= 0) return s0;
         const int Window = 40;
         long k0 = Math.Max(0, k - Window);
         var card = ECards[LocateIn(EPrefix, eg)];
         long eff = s0, prevEff = 0;
+        var (previousStart, previousBuy) = EPrice(eg, k0);
         for (long kk = k0 + 1; kk <= k; kk++)
         {
             var (sp, bp) = EPrice(eg, kk);
-            var (spp, bpp) = EPrice(eg, kk - 1);
-            long sPrevOp = (kk - 1 > k0) ? prevEff : spp;
-            var (hasBids, _, _, finalP) = ESimBids(card.Rare, card.Rating, eg, kk - 1, dur, (int)sPrevOp, (int)bpp, dur);
-            eff = (hasBids && finalP < bpp) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
+            long sPrevOp = (kk - 1 > k0) ? prevEff : previousStart;
+            var (hasBids, _, _, finalP) = ESimBids(card.Rare, card.Rating, eg, kk - 1, dur, (int)sPrevOp, previousBuy, dur);
+            eff = (hasBids && finalP < previousBuy) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
             if (eff > bp - Step(bp)) eff = Math.Max(sp, (long)bp - Step(bp));
             prevEff = eff;
+            previousBuy = bp;
         }
         return eff;
     }
@@ -783,7 +911,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
 
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
-        var rnd = new Random();
+        var rnd = Random.Shared;
         var sb = new StringBuilder("[");
         int written = 0;
         uint key = MarketKey; long scanFrom = start;
@@ -810,18 +938,18 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
 
         bool filteredX = leag > 0 || team > 0 || minBuyNow > 0 || maxBuyNow > 0
                          || minCurrent > 0 || maxCurrent > 0;
-        long block = (long)num * (filteredX ? 96 : 16);
+        long block = Math.Min(ServerOptions.Current.MarketScanLimit, (long)num * (filteredX ? 96 : 16));
         long winStart = (scanFrom / Math.Max(1L, (long)num)) * block;
-        var mc = new List<int>();
-        for (int i = 0; i < ECards.Length; i++)
-            if (ClubItemCatMatches(ECards[i].Type, cat) && TierOk(i) && TeamOk(i) && LeagueOk(i)) mc.Add(i);
-        if (mc.Count > 0)
+        var viewKey = new SelectionKey(2, Category: cat ?? "", Level: lev ?? "", League: leag, Team: team);
+        if (!SelectionCache.TryGetValue(viewKey, out var view))
+            view = RememberSelection(viewKey, CreateSelection(ECounts,
+                i => ClubItemCatMatches(ECards[i].Type, cat) && TierOk(i) && TeamOk(i) && LeagueOk(i)));
+        var mc = view.Indices;
+        if (mc.Length > 0)
         {
-            var vPrefix = new long[mc.Count + 1];
-            long acc = 0;
-            for (int k = 0; k < mc.Count; k++) { acc += ECounts[mc[k]]; vPrefix[k + 1] = acc; }
-            long vTotal = acc;
-            int vHalf = HalfBitsFor(vTotal);
+            var vPrefix = view.Prefix;
+            long vTotal = view.Total;
+            int vHalf = view.HalfBits;
             long scanCap = Math.Min(winStart + block, vTotal);   // stay inside the view -> no repeats
             for (long p = winStart; written < num && p < scanCap; p++)
             {
@@ -1002,21 +1130,30 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
     private static long FEffStart(long fg, long k, long dur, int s0, int buy)
     {
         if (k <= 0) return s0;
+        var key = new StartKey(3, fg, k);
+        return StartCache.TryGetValue(key, out long value) ? value
+            : RememberStart(key, FEffStartUncached(fg, k, dur, s0, buy));
+    }
+
+    private static long FEffStartUncached(long fg, long k, long dur, int s0, int buy)
+    {
+        if (k <= 0) return s0;
         const int Window = 40;
         long k0 = Math.Max(0, k - Window);
         int ci = LocateIn(FPrefix, fg);
         bool isMgr = FIsManager[ci];
         int rp = isMgr ? FManager[ci].Rating : FStaff[ci].Rating;
         long eff = s0, prevEff = 0;
+        var (previousStart, previousBuy) = FPrice(fg, k0);
         for (long kk = k0 + 1; kk <= k; kk++)
         {
             var (sp, bp) = FPrice(fg, kk);
-            var (spp, bpp) = FPrice(fg, kk - 1);
-            long sPrevOp = (kk - 1 > k0) ? prevEff : spp;
-            var (hasBids, _, _, finalP) = FSimBids(rp, isMgr, fg, kk - 1, dur, (int)sPrevOp, (int)bpp, dur);
-            eff = (hasBids && finalP < bpp) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
+            long sPrevOp = (kk - 1 > k0) ? prevEff : previousStart;
+            var (hasBids, _, _, finalP) = FSimBids(rp, isMgr, fg, kk - 1, dur, (int)sPrevOp, previousBuy, dur);
+            eff = (hasBids && finalP < previousBuy) ? Math.Max(sp, finalP) : sp;   // BIN'd sale -> fresh start
             if (eff > bp - Step(bp)) eff = Math.Max(sp, (long)bp - Step(bp));
             prevEff = eff;
+            previousBuy = bp;
         }
         return eff;
     }
@@ -1047,7 +1184,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
 
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
-        var rnd = new Random();
+        var rnd = Random.Shared;
         var sb = new StringBuilder("[");
         int written = 0;
         uint key = MarketKey; long scanFrom = start;
@@ -1058,23 +1195,25 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
             return lev switch { "bronze" => r < 65, "silver" => r is >= 65 and < 75, _ => r >= 75 };
         }
         bool NationOk(int i) => nat <= 0 || (FIsManager[i] && FManager[i].NationId == nat);
-        bool LeagueOk(int i) => leag <= 0 || (FIsManager[i] && FManager[i].LeagueId == leag);
+        // A manager's advertised league may be modified for this listing cycle;
+        // only immutable manager/staff eligibility belongs in the cached view.
+        bool LeagueEligible(int i) => leag <= 0 || FIsManager[i];
 
         bool filteredY = nat > 0 || leag > 0 || minBuyNow > 0 || maxBuyNow > 0
                          || minCurrent > 0 || maxCurrent > 0;
-        long block = (long)num * (filteredY ? 96 : 16);
+        long block = Math.Min(ServerOptions.Current.MarketScanLimit, (long)num * (filteredY ? 96 : 16));
         long winStart = (scanFrom / Math.Max(1L, (long)num)) * block;
 
-        var mc = new List<int>();
-        for (int i = 0; i < FIsManager.Length; i++)
-            if (StaffCatMatches(FIsManager[i], FStaff[i], cat) && TierOk(i) && NationOk(i) && LeagueOk(i)) mc.Add(i);
-        if (mc.Count > 0)
+        var viewKey = new SelectionKey(3, Category: cat ?? "", Level: lev ?? "", Nation: nat, League: leag > 0 ? 1 : 0);
+        if (!SelectionCache.TryGetValue(viewKey, out var view))
+            view = RememberSelection(viewKey, CreateSelection(FCounts,
+                i => StaffCatMatches(FIsManager[i], FStaff[i], cat) && TierOk(i) && NationOk(i) && LeagueEligible(i)));
+        var mc = view.Indices;
+        if (mc.Length > 0)
         {
-            var vPrefix = new long[mc.Count + 1];
-            long acc = 0;
-            for (int k = 0; k < mc.Count; k++) { acc += FCounts[mc[k]]; vPrefix[k + 1] = acc; }
-            long vTotal = acc;
-            int vHalf = HalfBitsFor(vTotal);
+            var vPrefix = view.Prefix;
+            long vTotal = view.Total;
+            int vHalf = view.HalfBits;
             long scanCap = Math.Min(winStart + block, vTotal);   // stay inside the view -> no repeats
             for (long p = winStart; written < num && p < scanCap; p++)
             {
@@ -1083,6 +1222,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
                 int ci = mc[k];
                 long fs = FPrefix[ci] + (fg - vPrefix[k]);
                 if (!LiveStaffAt(fs, now) || FSimBinnedThisCycle(fs, now)) continue;
+                if (leag > 0 && ManagerListingState(fs, FCycle(fs, now).k, FManager[ci]).League != leag) continue;
                 if (!FByPrice(fs, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
                 if (written > 0) sb.Append(',');
                 sb.Append(FEntry(fs, now, rnd));
@@ -1142,10 +1282,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         int mgrLeague = -1, mgrContract = 7;
         if (FIsManager[ci])
         {
-            uint mr = Hash((uint)fg, (uint)(cyc.k * 0x9E3779B1u)) ^ 0x2F6E2B57u;
-            if (mr % 100 >= 78 && TeamLeagues.AllLeagues.Length > 0)   // ~22% of listed managers carry a league modifier
-                mgrLeague = TeamLeagues.AllLeagues[(int)((mr >> 7) % (uint)TeamLeagues.AllLeagues.Length)];
-            if ((mr >> 14) % 100 >= 45) mgrContract = (int)((mr >> 21) % 7);   // ~55% worn contracts, 0 = out of contract
+            (mgrContract, mgrLeague) = ManagerListingState(fg, cyc.k, FManager[ci]);
         }
         string item = FIsManager[ci]
             ? WebServer.BuildManagerItem(FManager[ci], itemId, now, 5, rareFlag, "forSale", mgrLeague, mgrContract)
@@ -1159,6 +1296,26 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
                ",\"sellerName\":\"" + seller + "\",\"sellerEstablished\":2013," +
                "\"sellerId\":0,\"tradeOwner\":false,\"tradeIdStr\":" + tradeId +
                ",\"lastSalePrice\":0,\"coinsProcessed\":false}";
+    }
+
+    private static (int Contract, int League) ManagerListingState(long listing, long cycle, Manager manager)
+    {
+        int contract = 7, league = manager.LeagueId;
+        uint mr = Hash((uint)listing, (uint)(cycle * 0x9E3779B1u)) ^ 0x2F6E2B57u;
+        if (mr % 100 >= 78 && TeamLeagues.AllLeagues.Length > 0)
+            league = TeamLeagues.AllLeagues[(int)((mr >> 7) % (uint)TeamLeagues.AllLeagues.Length)];
+        if ((mr >> 14) % 100 >= 45) contract = (int)((mr >> 21) % 7);
+        return (contract, league);
+    }
+
+    internal static ManagerMod? ManagerListingMods(long tradeId, long now)
+    {
+        long listing = tradeId - StaffTradeIdBase;
+        if (listing < 0 || listing >= STotal) return null;
+        int index = LocateIn(FPrefix, listing);
+        if (!FIsManager[index]) return null;
+        var state = ManagerListingState(listing, FCycle(listing, now).k, FManager[index]);
+        return new ManagerMod { Contract = state.Contract, LeagueId = state.League };
     }
 
     internal static bool FResolveTradeId(long tradeId, out bool isManager, out Manager mgr, out StaffCard stf,
@@ -1425,8 +1582,9 @@ string seller = SellerFor(g, cyc.k);
             if (now < timing.EndsAt) continue;
             var card = Cards[Locate(g)];
             var (start, buy) = Price(card, g, timing.Cycle);
-            var (_, _, _, finalBid) = SimBids(card, g, timing.Cycle, timing.Duration, start, buy, timing.Duration);
-            outs.Add(new BidOutcome(kv.Key, card, start, buy, kv.Value, kv.Value >= finalBid));
+            int effectiveStart = (int)EffStart(card, g, timing.Cycle, timing.Duration, start, buy);
+            var (_, _, _, finalBid) = SimBids(card, g, timing.Cycle, timing.Duration, effectiveStart, buy, timing.Duration);
+            outs.Add(new BidOutcome(kv.Key, card, effectiveStart, buy, kv.Value, kv.Value >= finalBid));
         }
         return outs;
     }
@@ -1444,13 +1602,15 @@ string seller = SellerFor(g, cyc.k);
         int winning = 0, outbid = 0;
         foreach (var kv in MyBids)
         {
+            if (AcceptedOffers.ContainsKey(kv.Key)) continue;   // counted once below
             long g = kv.Key - TradeIdBase;
             if (g < 0 || g >= Total) continue;
             var cyc = Cycle(g, now);
             if (cyc.local >= cyc.dur) continue;   // ended -> settled on next poll
             var card = Cards[Locate(g)];
             var (start, buy) = Price(card, g, cyc.k);
-            var (_, sim, _, _) = SimBids(card, g, cyc.k, cyc.dur, start, buy, cyc.local);
+            int effectiveStart = (int)EffStart(card, g, cyc.k, cyc.dur, start, buy);
+            var (_, sim, _, _) = SimBids(card, g, cyc.k, cyc.dur, effectiveStart, buy, cyc.local);
             if (kv.Value >= sim) winning++; else outbid++;
         }
         foreach (var kv in AcceptedOffers) winning++;   // accepted offers count as wins in the watchlist
@@ -1508,22 +1668,18 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         return string.Join("&", parts);
     }
 
-    private static bool StyleOkFor(RealPlayer c, long g, long now, int playStyle)
-        => playStyle <= 0 || SimCardState(c, g, Cycle(g, now).k).Style == playStyle;
-
-    private static bool StyleOkForK(RealPlayer c, long g, long k, int playStyle)
-        => playStyle <= 0 || SimCardState(c, g, k).Style == playStyle;
-
-    private static bool PosOk(RealPlayer c, long g, long k, string[] wantPos)
+    private static bool ModsMatch(RealPlayer c, long g, long now, int playStyle, string[] wantPos)
     {
-        if (wantPos == null || wantPos.Length == 0) return true;
-        string eff = SimCardState(c, g, k).Pos ?? c.Position;
+        bool checkPosition = wantPos != null && wantPos.Length > 0;
+        if (playStyle <= 0 && !checkPosition) return true;
+        var mods = SimCardState(c, g, Cycle(g, now).k, includeTrainingBoost: false);
+        if (playStyle > 0 && mods.Style != playStyle) return false;
+        if (!checkPosition) return true;
+        string eff = mods.Pos ?? c.Position;
         for (int i = 0; i < wantPos.Length; i++)
             if (string.Equals(eff, wantPos[i], StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
-    private static bool PosOkNow(RealPlayer c, long g, long now, string[] wantPos)
-        => PosOk(c, g, Cycle(g, now).k, wantPos);
 
     private static bool ByPriceK(RealPlayer c, long g, long k, long dur, long local,
         int startBid, int buyNow, int mnB, int mxB, int mnC, int mxC)
@@ -1556,11 +1712,12 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         if (mxB > 0 && buyNow > mxB) return false;
         if (mnC > 0 || mxC > 0)
         {
-            long cur = startBid;
+            long cur = EffStart(c, g, cyc.k, cyc.dur, startBid, buyNow);
             if (cyc.local < cyc.dur)
             {
-                var (_, sim, _, _) = SimBids(c, g, cyc.k, cyc.dur, startBid, buyNow, cyc.local);
-                if (MyBids.TryGetValue(TradeIdBase + g, out long mb) && mb > sim) cur = mb;
+                var (_, sim, _, _) = SimBids(c, g, cyc.k, cyc.dur, (int)cur, buyNow, cyc.local);
+                if (AcceptedOffers.TryGetValue(TradeIdBase + g, out var offer)) cur = offer.Bid;
+                else if (MyBids.TryGetValue(TradeIdBase + g, out long mb) && mb > sim) cur = mb;
                 else cur = sim;
             }
             if (mnC > 0 && cur < mnC) return false;
@@ -1579,10 +1736,10 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         if (mxB > 0 && buyNow > mxB) return false;
         if (mnC > 0 || mxC > 0)
         {
-            long cur = startBid;
+            long cur = CEffStart(cg, cyc.k, cyc.dur, startBid, buyNow);
             if (cyc.local < cyc.dur)
             {
-                var (_, sim, _, _) = CSimBids(CTier[ci], cg, cyc.k, cyc.dur, startBid, buyNow, cyc.local);
+                var (_, sim, _, _) = CSimBids(CTier[ci], cg, cyc.k, cyc.dur, (int)cur, buyNow, cyc.local);
                 cur = sim;
             }
             if (mnC > 0 && cur < mnC) return false;
@@ -1601,10 +1758,10 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         if (mxB > 0 && buyNow > mxB) return false;
         if (mnC > 0 || mxC > 0)
         {
-            long cur = startBid;
+            long cur = EEffStart(eg, cyc.k, cyc.dur, startBid, buyNow);
             if (cyc.local < cyc.dur)
             {
-                var (_, sim, _, _) = ESimBids(ECards[i].Rare, ECards[i].Rating, eg, cyc.k, cyc.dur, startBid, buyNow, cyc.local);
+                var (_, sim, _, _) = ESimBids(ECards[i].Rare, ECards[i].Rating, eg, cyc.k, cyc.dur, (int)cur, buyNow, cyc.local);
                 cur = sim;
             }
             if (mnC > 0 && cur < mnC) return false;
@@ -1623,11 +1780,11 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         if (mxB > 0 && buyNow > mxB) return false;
         if (mnC > 0 || mxC > 0)
         {
-            long cur = startBid;
+            long cur = FEffStart(fg, cyc.k, cyc.dur, startBid, buyNow);
             if (cyc.local < cyc.dur)
             {
                 int r = FIsManager[i] ? FManager[i].Rating : FStaff[i].Rating;
-                var (_, sim, _, _) = FSimBids(r, FIsManager[i], fg, cyc.k, cyc.dur, startBid, buyNow, cyc.local);
+                var (_, sim, _, _) = FSimBids(r, FIsManager[i], fg, cyc.k, cyc.dur, (int)cur, buyNow, cyc.local);
                 cur = sim;
             }
             if (mnC > 0 && cur < mnC) return false;
@@ -1638,12 +1795,12 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
 
     internal static string PageJson(int start, int num, long now, Func<RealPlayer, bool> match = null,
         int minBuyNow = 0, int maxBuyNow = 0, int minCurrent = 0, int maxCurrent = 0, int playStyle = 0,
-        string sig = null, string[] wantPos = null)
+        string sig = null, string[] wantPos = null, PlayerFilterKey? selection = null)
     {
 
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
-        var rnd = new Random();
+        var rnd = Random.Shared;
         var sb = new StringBuilder("[");
         int written = 0;
         uint key = MarketKey; long scanFrom = start;
@@ -1653,7 +1810,7 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         long block = Math.Min(ServerOptions.Current.MarketScanLimit, (long)num * (filtered ? 96 : 16));
         long winStart = (scanFrom / Math.Max(1L, (long)num)) * block;
 
-        if (match == null)
+        if (match == null && (selection == null || selection.Value.IsUnfiltered))
         {
             {
                 long scanCap = Math.Min(winStart + block, Total);   // never re-roll past the market domain
@@ -1663,8 +1820,7 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
                     if (!LiveAt(g, now) || BoughtThisCycle(g, now) || SimBinnedThisCycle(g, now)) continue;   // sold / owned / not yet relisted
                     int i = Locate(g);
                     if (!ByPrice(Cards[i], g, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                    if (!StyleOkFor(Cards[i], g, now, playStyle)) continue;
-                    if (!PosOkNow(Cards[i], g, now, wantPos)) continue;
+                    if (!ModsMatch(Cards[i], g, now, playStyle, wantPos)) continue;
                     if (written > 0) sb.Append(',');
                     sb.Append(Entry(Cards[i], g, now, rnd));
                     written++;
@@ -1674,15 +1830,20 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         else
         {
             {
-                var mc = new List<int>();
-                for (int i = 0; i < Cards.Length; i++) if (match(Cards[i])) mc.Add(i);
-                if (mc.Count > 0)
+                SelectionView view;
+                if (selection is { } filter)
                 {
-                    var vPrefix = new long[mc.Count + 1];
-                    long acc = 0;
-                    for (int k = 0; k < mc.Count; k++) { acc += Counts[mc[k]]; vPrefix[k + 1] = acc; }
-                    long vTotal = acc;
-                    int vHalf = HalfBitsFor(vTotal);
+                    var viewKey = new SelectionKey(0, filter);
+                    if (!SelectionCache.TryGetValue(viewKey, out view))
+                        view = RememberSelection(viewKey, CreateSelection(Counts, i => filter.Matches(Cards[i])));
+                }
+                else view = CreateSelection(Counts, i => match(Cards[i]));
+                var mc = view.Indices;
+                if (mc.Length > 0)
+                {
+                    var vPrefix = view.Prefix;
+                    long vTotal = view.Total;
+                    int vHalf = view.HalfBits;
                     long scanCap = Math.Min(winStart + block, vTotal);   // stay inside the view -> no repeats
                     for (long p = winStart; written < num && p < scanCap; p++)
                     {
@@ -1692,8 +1853,7 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
                         long g = Prefix[ci] + (fg - vPrefix[k]);   // real global index -> stable tradeId
                         if (!LiveAt(g, now) || BoughtThisCycle(g, now) || SimBinnedThisCycle(g, now)) continue;   // sold / owned / not yet relisted
                         if (!ByPrice(Cards[ci], g, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                        if (!StyleOkFor(Cards[ci], g, now, playStyle)) continue;
-                        if (!PosOkNow(Cards[ci], g, now, wantPos)) continue;
+                        if (!ModsMatch(Cards[ci], g, now, playStyle, wantPos)) continue;
                         if (written > 0) sb.Append(',');
                         sb.Append(Entry(Cards[ci], g, now, rnd));
                         written++;
@@ -1948,6 +2108,9 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         ("CDM", "CM"), ("CM", "CDM"), ("CAM", "CDM"), ("CDM", "CAM"), ("RWB", "RB"), ("RB", "RWB"),
         ("LWB", "LB"), ("LB", "LWB"),
     };
+    private static readonly Dictionary<string, string[]> PositionTargets = PositionChanges
+        .GroupBy(pair => pair.From, StringComparer.Ordinal)
+        .ToDictionary(group => group.Key, group => group.Select(pair => pair.To).ToArray(), StringComparer.Ordinal);
 
     private static string MktPlayerItem(RealPlayer card, long g, long k, long itemId, long now)
     {
@@ -1957,7 +2120,7 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
     }
 
     private static (int Contract, int Fitness, int Morale, int Style, string Pos, int TrainingFlag, int[] Boost)
-        SimCardState(RealPlayer card, long g, long k)
+        SimCardState(RealPlayer card, long g, long k, bool includeTrainingBoost = true)
     {
         var r = new Rng(Hash((uint)g, (uint)(k * 0x9E3779B1u)) ^ 0x2F6E2B57u);
         int contract = 7, fitness = 99, morale = 50, style = 250, trainingFlag = -1;
@@ -1974,15 +2137,17 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         }
         if (r.NextDouble() >= 0.80)
         {
-            var to = PositionChanges.Where(pair => pair.From == card.Position)
-                                    .Select(pair => pair.To).ToArray();
-            if (to.Length > 0) pos = to[(int)(r.NextDouble() * to.Length)];
+            if (PositionTargets.TryGetValue(card.Position, out var to))
+                pos = to[(int)(r.NextDouble() * to.Length)];
         }
         if (r.NextDouble() >= 0.85)
         {
             trainingFlag = 1;
-            boost = new int[6];
-            boost[(int)(r.NextDouble() * 6)] += 6;
+            if (includeTrainingBoost)
+            {
+                boost = new int[6];
+                boost[(int)(r.NextDouble() * 6)] += 6;
+            }
         }
         return (contract, fitness, morale, style, pos, trainingFlag, boost);
     }
@@ -2030,7 +2195,7 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
 
     internal static long CheapestLiveBuyNow(RealPlayer card, long now)
     {
-        if (CheapCache.TryGetValue(card.CardId, out var e) && now - e.At < CheapCacheTtlSec) return e.MinBuy;
+        if (CheapCache.TryGetValue(card.CardId, out var e) && now >= e.At && now - e.At < CheapCacheTtlSec) return e.MinBuy;
 
         if (!CardIndexByCardId.TryGetValue(card.CardId, out int ci))
         {
@@ -2044,7 +2209,10 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         {
             for (long g = Prefix[ci]; g < Prefix[ci + 1]; g++)
             {
-                if (!LiveAt(g, now) || BoughtThisCycle(g, now) || SimBinnedThisCycle(g, now)) continue;
+                // This shared estimate values user listings and trade offers against
+                // the virtual market. Private account purchases must not change
+                // another account's valuation or enter a cross-account cache.
+                if (!LiveAt(g, now) || SimBinnedThisCycle(g, now)) continue;
                 var cyc = Cycle(g, now);
                 var (_, buy) = Price(Cards[ci], g, cyc.k);
                 if (buy < min) min = buy;

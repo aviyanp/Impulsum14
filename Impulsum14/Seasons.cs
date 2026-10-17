@@ -96,7 +96,7 @@ internal static class Seasons
             return new
             {
                 id = index + 1, divisionId = wire, type = online ? "ONLINE" : "OFFLINE", numMatches = Rounds, matchLengthMin = 6,
-                matches = Enumerable.Range(0, Rounds).Select(i => new { teamId = TeamFor(division, i), difficulty = Difficulty(division, i + 1), rewardMult = 1, roundId = i, coins = 250 + (10 - division) * 25 + i * 10 }),
+                matches = Enumerable.Range(0, Rounds).Select(i => new { teamId = TeamFor(division, i), difficulty = Difficulty(division, i + 1), rewardMult = 1, roundId = i, coins = online ? ServerOptions.Current.Ranked.WinCoins : ServerOptions.Current.MatchWinCoins }),
                 prizeSet = prizes, elgOperation = "AND", elgReq = Array.Empty<object>(), trophyResourceId = -1, trophyUseCount = 0,
                 visStartDays = 3650, visEndDays = 3650, startDateTime = 0, endDateTime = int.MaxValue, untilStartSeconds = 0, untilEndSeconds = 315360000
             };
@@ -233,7 +233,10 @@ internal static class Seasons
 
     internal static string HistoryJson(bool? online = null)
     {
-        var entries = (FutProfileStore.Get().SeasonHistory ?? new()).Where(s => !online.HasValue || s.Online == online.Value).Reverse().ToArray();
+        // Ranked projection can append older online entries after newer offline
+        // ones. Present completion order independently of storage/merge order.
+        var entries = (FutProfileStore.Get().SeasonHistory ?? new()).Where(s => !online.HasValue || s.Online == online.Value)
+            .Reverse().OrderByDescending(s => s.FinishedAt).ThenByDescending(s => s.SeasonId).ToArray();
         return JsonSerializer.Serialize(new
         {
             seasons = entries.Select(s => new { id = s.SeasonId, type = s.Online ? "ONLINE" : "OFFLINE", divisionId = s.Division, numMatches = s.Won + s.Draw + s.Lost, points = s.Points, won = s.Won, draw = s.Draw, lost = s.Lost, prizeLevel = s.Outcome, coins = s.Coins, finishedAt = s.FinishedAt }),

@@ -10,6 +10,23 @@ internal static class PersistenceTests
 {
     internal static void Register(Action<string, Func<Task>> test)
     {
+        test("Uncertain account persistence blocks further actions until canonical recovery", () => WithFixture(async fixture =>
+        {
+            var session = fixture.Repository.Authenticate(fixture.Token1);
+            await Run(fixture.Repository, session, () => FutProfileStore.Mutate(p => p.Coins = 321));
+            // Model the outcome of a directory-flush failure after publication.
+            // Recovery must be explicit; rolling memory back does not prove what
+            // survived on disk, so no later request can spend the old balance.
+            session.Account.PersistenceFailure = new IOException("Uncertain directory flush");
+            bool invoked = false;
+            await ThrowsAsync<IOException>(() => Run(fixture.Repository, session, () => invoked = true));
+            Check(!invoked, "An uncertain account continued accepting requests.");
+            fixture.Reopen();
+            var recovered = fixture.Repository.Authenticate(fixture.Token1);
+            await Run(fixture.Repository, recovered, () => Check(FutProfileStore.Get().Coins == 321, "Restart did not reload canonical wallet state."));
+            Check(!File.Exists(fixture.StatePath(2001) + ".tmp"), "A successful durable replacement left its staging file.");
+        }));
+
         test("Initialization and failed durable commits roll the whole account back", () => WithFixture(async fixture =>
         {
             var initial = new PlayerState();

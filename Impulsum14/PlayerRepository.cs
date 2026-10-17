@@ -66,6 +66,9 @@ internal sealed class PlayerAccount
     internal long Revision { get; set; }
     internal Dictionary<string, CachedHttpReply> HttpCache { get; } = new(StringComparer.Ordinal);
     internal int HttpCacheBytes { get; set; }
+    internal string HttpCacheSession { get; set; } = "";
+    internal long LastMarketMaintenanceSecond { get; set; } = -1;
+    internal Exception PersistenceFailure { get; set; }
     internal byte[] Committed { get; set; }
     internal long LastMaintenance;
     private long _rateState;
@@ -95,6 +98,7 @@ internal static class PlayerContext
     internal static void MarkDirty()
     {
         var player = Current;
+        player.LastMarketMaintenanceSecond = -1;
         if (player.Dirty) return;
         player.Dirty = true;
         // Maintenance can settle a bid immediately before a GET. Invalidate before
@@ -318,6 +322,7 @@ internal sealed class PlayerRepository : IDisposable
     private async Task<T> ExecuteAsync<T>(PlayerSession session, Func<Task<T>> action)
     {
         var player = session.Account;
+        if (player.PersistenceFailure is not null) throw new IOException("Account requires restart after an uncertain durable commit.", player.PersistenceFailure);
         using var scope = PlayerContext.Enter(session);
         bool initializedBefore = player.Initialized;
         try
@@ -339,6 +344,7 @@ internal sealed class PlayerRepository : IDisposable
         {
             if (player.Dirty) player.Data = JsonSerializer.Deserialize<PlayerState>(player.Committed, JsonOptions)!;
             player.Dirty = false;
+            player.LastMarketMaintenanceSecond = -1;
             player.HttpCache.Clear(); player.HttpCacheBytes = 0;
             player.Initialized = initializedBefore;
             throw;
@@ -429,6 +435,7 @@ internal sealed class PlayerRepository : IDisposable
         if (bytes.AsSpan().SequenceEqual(player.Committed)) { player.Dirty = false; return; }
         string path = StatePath(player.Id);
         string temporary = path + ".tmp";
+        bool published = false;
         try
         {
             // The full snapshot is already a contiguous byte array; an additional
@@ -438,14 +445,21 @@ internal sealed class PlayerRepository : IDisposable
                 await file.WriteAsync(bytes).ConfigureAwait(false);
                 file.Flush(flushToDisk: true);
             }
-            File.Move(temporary, path, overwrite: true);
+            DurableFile.Replace(temporary, path, _playersDirectory, ref published);
             player.Committed = bytes;
             player.Revision++;
             player.HttpCache.Clear(); player.HttpCacheBytes = 0;
             player.Dirty = false;
             ServerMetrics.RecordDurableCommit(bytes.Length, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
         }
-        catch { ServerMetrics.RecordCommitFailure(); throw; }
+        catch (Exception ex)
+        {
+            // A successful rename followed by failed directory persistence has an
+            // uncertain durable outcome. Never serve the rolled-back wallet again
+            // in this process; recovery must reload the canonical snapshot.
+            if (published) player.PersistenceFailure = ex;
+            ServerMetrics.RecordCommitFailure(); throw;
+        }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
