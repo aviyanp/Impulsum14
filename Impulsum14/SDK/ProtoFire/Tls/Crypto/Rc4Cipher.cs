@@ -78,7 +78,7 @@ public class Rc4Cipher
     public TlsEncodeResult EncodePlaintext(long seqNo, short contentType, ProtocolVersion recordVersion, int headerAllocation,
         byte[] plaintext, int offset, int len)
     {
-        throw new NotImplementedException();
+        return EncodePlaintext(seqNo, contentType, recordVersion, headerAllocation, plaintext.AsSpan(offset, len));
     }
 
     public TlsEncodeResult EncodePlaintext(long seqNo, short contentType, ProtocolVersion recordVersion, int headerAllocation,
@@ -114,12 +114,12 @@ public class Rc4Cipher
 
     public void RekeyDecoder()
     {
-        throw new NotImplementedException();
+        throw new TlsFatalAlert(AlertDescription.unexpected_message); // TLS 1.3 key updates do not apply to this legacy cipher.
     }
 
     public void RekeyEncoder()
     {
-        throw new NotImplementedException();
+        throw new TlsFatalAlert(AlertDescription.unexpected_message); // TLS 1.3 key updates do not apply to this legacy cipher.
     }
 
     public bool UsesOpaqueRecordType => false;

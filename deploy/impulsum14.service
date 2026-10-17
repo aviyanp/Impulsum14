@@ -1,0 +1,26 @@
+[Unit]
+Description=Impulsum14 FIFA 14 backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=impulsum14
+Group=impulsum14
+WorkingDirectory=/opt/impulsum14
+ExecStart=/usr/bin/dotnet /opt/impulsum14/Impulsum14.dll
+Environment=FIFA14_CONFIG=/etc/impulsum14/server.json
+Restart=on-failure
+RestartSec=3
+StateDirectory=impulsum14
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/impulsum14
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=16384
+
+[Install]
+WantedBy=multi-user.target

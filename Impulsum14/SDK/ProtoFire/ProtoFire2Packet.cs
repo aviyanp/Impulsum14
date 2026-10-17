@@ -19,13 +19,15 @@ public class ProtoFire2Packet : ProtoFirePacket
         MetadataData = metadataData;
     }
 
-    public static ProtoFire2Packet? ReadFrom(Stream stream)
+    public static ProtoFire2Packet? ReadFrom(Stream stream, int maxFrameBytes = 1048576)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFrameBytes);
         try
         {
             Fire2Frame frame = new Fire2Frame();
             frame.Initialize(stream);
 
+            if ((long)frame.PayloadSize + frame.MetadataSize > maxFrameBytes) throw new InvalidDataException("Frame exceeds limit.");
             byte[] metadataData = Array.Empty<byte>();
             if (frame.MetadataSize > 0)
             {
@@ -42,43 +44,46 @@ public class ProtoFire2Packet : ProtoFirePacket
 
             return new ProtoFire2Packet(frame, metadataData, data);
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentException or OverflowException)
         {
             return null;
         }
     }
 
-    public static async Task<ProtoFire2Packet?> ReadFromAsync(Stream stream)
+    public static async Task<ProtoFire2Packet?> ReadFromAsync(Stream stream, int maxFrameBytes = 1048576, CancellationToken cancellationToken = default)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFrameBytes);
         try
         {
             Fire2Frame frame = new Fire2Frame();
-            await frame.InitializeAsync(stream).ConfigureAwait(false);
+            await frame.InitializeAsync(stream, cancellationToken).ConfigureAwait(false);
 
+            if ((long)frame.PayloadSize + frame.MetadataSize > maxFrameBytes) throw new InvalidDataException("Frame exceeds limit.");
             byte[] metadataData = Array.Empty<byte>();
             if (frame.MetadataSize > 0)
             {
                 metadataData = new byte[frame.MetadataSize];
-                await stream.ReadExactlyAsync(metadataData, 0, frame.MetadataSize).ConfigureAwait(false);
+                await stream.ReadExactlyAsync(metadataData.AsMemory(), cancellationToken).ConfigureAwait(false);
             }
 
             byte[] data = Array.Empty<byte>();
             if (frame.PayloadSize > 0)
             {
                 data = new byte[frame.PayloadSize];
-                await stream.ReadExactlyAsync(data, 0, (int)frame.PayloadSize).ConfigureAwait(false);
+                await stream.ReadExactlyAsync(data.AsMemory(), cancellationToken).ConfigureAwait(false);
             }
 
             return new ProtoFire2Packet(frame, metadataData, data);
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentException or OverflowException)
         {
             return null;
         }
     }
 
-    public new void WriteTo(Stream stream)
+    public override void WriteTo(Stream stream)
     {
+        if (MetadataData.Length > ushort.MaxValue) throw new InvalidDataException("Fire2 metadata exceeds its wire length.");
         Frame.PayloadSize = (uint)Data.Length;
         Frame.MetadataSize = (ushort)MetadataData.Length;
 
@@ -91,17 +96,18 @@ public class ProtoFire2Packet : ProtoFirePacket
             stream.Write(Data, 0, Data.Length);
     }
 
-    public new async Task WriteToAsync(Stream stream)
+    public override async Task WriteToAsync(Stream stream, CancellationToken cancellationToken = default)
     {
+        if (MetadataData.Length > ushort.MaxValue) throw new InvalidDataException("Fire2 metadata exceeds its wire length.");
         Frame.PayloadSize = (uint)Data.Length;
         Frame.MetadataSize = (ushort)MetadataData.Length;
 
-        await Frame.WriteToAsync(stream).ConfigureAwait(false);
+        await Frame.WriteToAsync(stream, cancellationToken).ConfigureAwait(false);
 
         if (MetadataData.Length > 0)
-            await stream.WriteAsync(MetadataData, 0, MetadataData.Length).ConfigureAwait(false);
+            await stream.WriteAsync(MetadataData.AsMemory(), cancellationToken).ConfigureAwait(false);
 
         if (Data.Length > 0)
-            await stream.WriteAsync(Data, 0, Data.Length).ConfigureAwait(false);
+            await stream.WriteAsync(Data.AsMemory(), cancellationToken).ConfigureAwait(false);
     }
 }

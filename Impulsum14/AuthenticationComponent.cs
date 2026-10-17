@@ -9,64 +9,56 @@ namespace Impulsum14;
 
 internal sealed class AuthenticationComponent : AuthenticationComponentBase.Server
 {
-    private const long UserId = 1000;
-    private static readonly string PersonaName = UserConfig.Username;
+    private static long UserId => PlayerContext.Current.Id;
+    private static string PersonaName => PlayerContext.Current.Name;
     private const string Email = "player@fifa14.local";
-    private const string SessionKey = "fifa14sessionkey";
+    private static string SessionKey => PlayerContext.Session.Key;
     private const uint Locale = 1701729619;
 
     public override Task<LoginResponse> LoginAsync(LoginRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine($"[Auth] Login: {request.Email}");
+        ServerDiagnostics.Write($"[Auth] Login: {request.Email}");
         return Task.FromResult(new LoginResponse
         {
             UserId = UserId,
             SessionKey = SessionKey,
             NeedsLegalDoc = false,
             IsOfLegalContactAge = true,
-            PCLoginToken = "fifa14token",
+            PCLoginToken = SessionKey,
             PersonaDetailsList = new List<PersonaDetails> { MakePersona() },
         });
     }
 
     public override Task<FullLoginResponse> SilentLoginAsync(SilentLoginRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Auth] SilentLogin");
-        return Task.FromResult(MakeFullLoginResponse("fifa14token"));
+        ServerDiagnostics.Write("[Auth] SilentLogin");
+        return Task.FromResult(MakeFullLoginResponse(SessionKey));
     }
 
     public override Task<FullLoginResponse> OriginLoginAsync(OriginLoginRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine($"[Auth] OriginLogin token: {request.AuthToken}");
+        ServerDiagnostics.Write("[Auth] OriginLogin");
         var connection = (BlazeRpcConnection)context.Connection;
-        var response = MakeFullLoginResponse(request.AuthToken ?? "fifa14token");
+        var response = MakeFullLoginResponse(SessionKey);
 
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(100);
-            await PushUserSessionAsync(connection);
-        });
+        _ = PushUserSessionAsync(connection);
 
         return Task.FromResult(response);
     }
 
     public override Task<FullLoginResponse> ExpressLoginAsync(ExpressLoginRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine($"[Auth] ExpressLogin: {request.Email}");
+        ServerDiagnostics.Write($"[Auth] ExpressLogin: {request.Email}");
         var connection = (BlazeRpcConnection)context.Connection;
 
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(100);
-            await PushUserSessionAsync(connection);
-        });
+        _ = PushUserSessionAsync(connection);
 
-        return Task.FromResult(MakeFullLoginResponse("fifa14token"));
+        return Task.FromResult(MakeFullLoginResponse(SessionKey));
     }
 
     public override async Task<SessionInfo> LoginPersonaAsync(LoginPersonaRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine($"[Auth] LoginPersona: {request.PersonaName}");
+        ServerDiagnostics.Write($"[Auth] LoginPersona: {request.PersonaName}");
         var connection = (BlazeRpcConnection)context.Connection;
         var session = MakeSession();
 
@@ -101,7 +93,7 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
     // Without these the client times out after sign-in.
     private static async Task PushUserSessionAsync(BlazeRpcConnection connection)
     {
-        Console.WriteLine("[Notify] PushUserSession START");
+        ServerDiagnostics.Write("[Notify] PushUserSession START");
         await Send("UserAuthenticated", () =>
             UserSessionsNotifications.SendUserAuthenticatedAsync(connection, UserId, subscribed: true));
 
@@ -117,34 +109,36 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
                     ExternalId = 0,
                     Name = PersonaName,
                 },
-            }, sendNow: true));
+            }, sendNow: false));
 
         await Send("ExtendedDataUpdate", () => UserSessionsBase.Server.NotifyUserSessionExtendedDataUpdateAsync(connection,
             new UserSessionExtendedDataUpdate
             {
                 ExtendedData = new UserSessionExtendedData(),
                 UserId = UserId,
-            }, sendNow: true));
+            }, sendNow: false));
 
         await Send("ServerCensusData", () => CensusDataComponentBase.Server.NotifyNotifyServerCensusDataAsync(connection,
             new NotifyServerCensusData { CensusDataList = new List<NotifyServerCensusDataItem>() }));
-        Console.WriteLine("[Notify] PushUserSession DONE");
+        ServerDiagnostics.Write("[Notify] PushUserSession DONE");
     }
     private static async Task Send(string name, Func<Task> send)
     {
-        try { await send(); Console.WriteLine($"[Notify] sent {name}"); }
-        catch (Exception ex) { Console.WriteLine($"[Notify] FAILED {name}: {ex.GetType().Name}: {ex.Message}"); }
+        try { await send(); ServerDiagnostics.Write($"[Notify] sent {name}"); }
+        catch (Exception ex) { ServerDiagnostics.Write($"[Notify] FAILED {name}: {ex.GetType().Name}: {ex.Message}"); }
     }
 
     public override Task<EmptyMessage> LogoutPersonaAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Auth] LogoutPersona");
+        ServerDiagnostics.Write("[Auth] LogoutPersona");
         return Task.FromResult(new EmptyMessage());
     }
 
     public override Task<EmptyMessage> LogoutAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Auth] Logout");
+        ServerDiagnostics.Write("[Auth] Logout");
+        PlayerRepository.Instance.Revoke(PlayerContext.Session);
+        context.Connection.State = null;
         return Task.FromResult(new EmptyMessage());
     }
 
@@ -160,7 +154,7 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
 
     public override Task<Entitlements> ListUserEntitlements2Async(ListUserEntitlements2Request request, BlazeRpcContext context)
     {
-        Console.WriteLine($"[Auth] ListUserEntitlements2: {request.ProjectId}");
+        ServerDiagnostics.Write($"[Auth] ListUserEntitlements2: {request.ProjectId}");
         return Task.FromResult(new Entitlements
         {
             mEntitlements = new List<Entitlement>
@@ -183,13 +177,13 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
 
     public override Task<UpdateAccountResponse> UpdateAccountAsync(UpdateAccountRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine($"[Auth] UpdateAccount Email='{request.Email}' Country='{request.Country}' " +
+        ServerDiagnostics.Write($"[Auth] UpdateAccount Email='{request.Email}' Country='{request.Country}' " +
             $"DOB='{request.DOB}' Lang='{request.Language}' GlobalOptin={request.GlobalOptin} " +
             $"ThirdPartyOptin={request.ThirdPartyOptin}");
         // Persist any non-empty fields (empty values from the game's sync are ignored).
         AccountStore.Update(request.Email, request.Country, request.DOB, request.Language,
             (byte)request.GlobalOptin, (byte)request.ThirdPartyOptin);
-        return Task.FromResult(new UpdateAccountResponse { PCLoginToken = "fifa14token" });
+        return Task.FromResult(new UpdateAccountResponse { PCLoginToken = SessionKey });
     }
 
     public override Task<Entitlements> ListEntitlementsAsync(ListEntitlementsRequest request, BlazeRpcContext context)
@@ -197,7 +191,7 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
         var groups = request.GroupNameList is { Count: > 0 }
             ? request.GroupNameList
             : new List<string> { "FIFA14PCBoxContent", "FIFA14PCFUTContentUnlocks" };
-        Console.WriteLine($"[Auth] ListEntitlements groups=[{string.Join(",", groups)}]");
+        ServerDiagnostics.Write($"[Auth] ListEntitlements groups=[{string.Join(",", groups)}]");
 
         var list = new List<Entitlement>();
         foreach (var g in groups)
@@ -219,7 +213,7 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
     public override Task<AccountInfo> GetAccountAsync(EmptyMessage request, BlazeRpcContext context)
     {
         var acct = AccountStore.Get();
-        Console.WriteLine($"[Auth] GetAccount -> Email='{acct.Email}' Country='{acct.Country}' DOB='{acct.Dob}' Lang='{acct.Language}'");
+        ServerDiagnostics.Write($"[Auth] GetAccount -> Email='{acct.Email}' Country='{acct.Country}' DOB='{acct.Dob}' Lang='{acct.Language}'");
         return Task.FromResult(new AccountInfo
         {
             AnonymousUser = false,
@@ -242,25 +236,25 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
 
     public override Task<ListPersonasResponse> ListPersonasAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Auth] ListPersonas");
+        ServerDiagnostics.Write("[Auth] ListPersonas");
         return Task.FromResult(new ListPersonasResponse { List = new List<PersonaDetails> { MakePersona() } });
     }
 
     public override Task<EmptyMessage> HasEntitlementAsync(HasEntitlementRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine($"[Auth] HasEntitlement: {request.EntitlementTag}");
+        ServerDiagnostics.Write($"[Auth] HasEntitlement: {request.EntitlementTag}");
         return Task.FromResult(new EmptyMessage());
     }
 
     public override Task<EmptyMessage> AcceptTosAsync(AcceptTosRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Auth] AcceptTos");
+        ServerDiagnostics.Write("[Auth] AcceptTos");
         return Task.FromResult(new EmptyMessage());
     }
 
     public override Task<GetLegalDocsInfoResponse> GetLegalDocsInfoAsync(GetLegalDocsInfoRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Auth] GetLegalDocsInfo");
+        ServerDiagnostics.Write("[Auth] GetLegalDocsInfo");
 
         return Task.FromResult(new GetLegalDocsInfoResponse
         {
@@ -271,7 +265,7 @@ internal sealed class AuthenticationComponent : AuthenticationComponentBase.Serv
 
     public override Task<EmptyMessage> CheckSinglePlayerLoginAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Auth] CheckSinglePlayerLogin");
+        ServerDiagnostics.Write("[Auth] CheckSinglePlayerLogin");
         return Task.FromResult(new EmptyMessage());
     }
 

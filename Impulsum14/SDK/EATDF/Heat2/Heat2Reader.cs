@@ -1,4 +1,4 @@
-﻿using EATDF.Extensions;
+using EATDF.Extensions;
 using EATDF.Heat;
 using EATDF.Internal;
 using EATDF.Members;
@@ -24,6 +24,21 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
     /// Maximum allowed size to stack allocate before falling back to heap allocation.
     /// </summary>
     const int MaxStackAlloc = 512;
+    private int _nesting;
+    private int _remainingWork = 131072;
+    private int _unknownMembers;
+    private void ChargeWork(int amount = 1)
+    {
+        if (amount < 0 || (_remainingWork -= amount) < 0)
+            throw new InvalidDataException("TDF decoding work limit exceeded.");
+    }
+    private IDisposable EnterNesting()
+    {
+        if (++_nesting > 64) throw new InvalidDataException("TDF nesting limit exceeded.");
+        return new NestingScope(this);
+    }
+    private sealed class NestingScope(Heat2Reader owner) : IDisposable { public void Dispose() => owner._nesting--; }
+
 
     /// <summary>
     /// The string encoder to use for decoding strings.
@@ -109,8 +124,8 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
     };
 
 
-    static MethodInfo _createListReaderMethod = typeof(HeatReader).GetMethod(nameof(createListTypeReader), BindingFlags.NonPublic | BindingFlags.Static)!;
-    static MethodInfo _createMapReaderMethod = typeof(HeatReader).GetMethod(nameof(createMapTypeReader), BindingFlags.NonPublic | BindingFlags.Static)!;
+    static MethodInfo _createListReaderMethod = typeof(Heat2Reader).GetMethod(nameof(createListTypeReader), BindingFlags.NonPublic | BindingFlags.Static)!;
+    static MethodInfo _createMapReaderMethod = typeof(Heat2Reader).GetMethod(nameof(createMapTypeReader), BindingFlags.NonPublic | BindingFlags.Static)!;
 
     /// <summary>
     /// Returns the reader for the specified type.
@@ -166,7 +181,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
         if (type.IsEnum)
             return createEnumTypeReader<T>(type);
 
-        if (type.IsSubclassOf(typeof(Union)))
+        if (typeof(Union).IsAssignableFrom(type))
             return (Heat2Reader reader, [NotNullWhen(true)] out T value, bool visitHeader) =>
             {
                 Union union = (Union)Activator.CreateInstance(type)!;
@@ -185,13 +200,13 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
         if (Helpers.IsList(type))
         {
             Type[] typeArgs = type.GetGenericArguments();
-            return (TypeReader<T>)_createListReaderMethod.MakeGenericMethod(typeArgs).Invoke(null, null)!;
+            return (TypeReader<T>)_createListReaderMethod.MakeGenericMethod(typeArgs).Invoke(null, new object[] { type })!;
         }
 
         if (Helpers.IsDictionary(type))
         {
             Type[] typeArgs = type.GetGenericArguments();
-            return (TypeReader<T>)_createMapReaderMethod.MakeGenericMethod(typeArgs).Invoke(null, null)!;
+            return (TypeReader<T>)_createMapReaderMethod.MakeGenericMethod(typeArgs).Invoke(null, new object[] { type })!;
         }
 
         // Unknown type :(
@@ -234,6 +249,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
     /// <returns>True if the header was read successfully, otherwise false. False also indicates fatal decode error.</returns>
     public bool TryReadHeat2MemberHeader(out Heat2MemberHeader header)
     {
+        ChargeWork();
         Span<byte> bytes = stackalloc byte[HeaderSize];
 
         if (!Stream.ReadAll(bytes))
@@ -280,43 +296,33 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
     /// <returns>True if the value was read successfully, otherwise false. False also indicates fatal decode error.</returns>
     public bool TryReadVarInt(out long value)
     {
-        long b = Stream.ReadByte();
-        value = b;
-        if (value == -1)
+        ChargeWork();
+        int first = Stream.ReadByte();
+        value = 0;
+        if (first < 0)
         {
             OnFatalDecodeError();
             return false;
         }
-
-        byte i = 6;
-
-        bool negative = (value & 0x40) != 0;
-        bool readNext = (value & 0x80) != 0;
-        value &= 0x3F;
-
-        while (readNext)
+        bool negative = (first & 0x40) != 0;
+        ulong magnitude = (uint)(first & 0x3F);
+        int current = first;
+        int shift = 6;
+        while ((current & 0x80) != 0)
         {
-            b = Stream.ReadByte();
-            if (b == -1)
+            current = Stream.ReadByte();
+            // Heat2 signed-magnitude integers use six bits in the first byte,
+            // then seven bits per byte, with at most 64 magnitude bits.
+            if (current < 0 || shift > 62 || (shift == 62 && (current & 0x7F) > 3))
             {
                 OnFatalDecodeError();
                 return false;
             }
-
-            value |= (b & 0x7F) << i;
-            i += 7;
-
-            readNext = b >> 7 != 0;
+            magnitude |= (ulong)(current & 0x7F) << shift;
+            shift += 7;
         }
-
-        if (negative)
-        {
-            if (value != 0)
-                value = -value;
-            else
-                value = long.MinValue;
-        }
-
+        value = unchecked((long)magnitude);
+        if (negative) value = magnitude == 0 ? long.MinValue : unchecked(-value);
         return true;
     }
 
@@ -703,8 +709,9 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
     /// <returns>True if the value was read successfully, otherwise false. False also indicates fatal decode error.</returns>
     public bool TryReadString(out string value)
     {
-        if (!TryReadVarInt(out long strLen) || strLen < 0)
+        if (!TryReadVarInt(out long strLen) || strLen < 0 || strLen > 1048576 || (Stream.CanSeek && strLen > Stream.Length - Stream.Position))
         {
+            OnFatalDecodeError();
             value = string.Empty;
             return false;
         }
@@ -718,29 +725,23 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
             ? new Span<byte>(rentedPool = ArrayPool<byte>.Shared.Rent(length), 0, length)
             : stackalloc byte[length];
 
-        if (!Stream.ReadAll(bytes))
+        try
         {
-            OnFatalDecodeError();
-            value = string.Empty;
-            return false;
+            if (!Stream.ReadAll(bytes))
+            {
+                OnFatalDecodeError();
+                value = string.Empty;
+                return false;
+            }
+            int len = bytes.Length;
+            if (len > 0 && bytes[len - 1] == 0) len--;
+            value = StringEncoder.GetString(bytes[..len]);
+            return true;
         }
-
-        int len = bytes.Length;
-        if (len > 0)
+        finally
         {
-            int lengthWithoutTrailingByte = len - 1;
-            if (bytes[lengthWithoutTrailingByte] == 0x00)
-                len = lengthWithoutTrailingByte;
+            if (rentedPool != null) ArrayPool<byte>.Shared.Return(rentedPool);
         }
-
-        Span<byte> strBytes = bytes.Slice(0, len);
-        value = StringEncoder.GetString(strBytes);
-
-        // return the rented pool if used
-        if (rentedPool != null)
-            ArrayPool<byte>.Shared.Return(rentedPool);
-
-        return true;
     }
 
     #endregion
@@ -765,8 +766,9 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
     /// <returns>True if the value was read successfully, otherwise false. False also indicates fatal decode error.</returns>
     public bool TryReadBlob(out byte[] value)
     {
-        if (!TryReadVarInt(out long length) || length < 0)
+        if (!TryReadVarInt(out long length) || length < 0 || length > 1048576 || (Stream.CanSeek && length > Stream.Length - Stream.Position))
         {
+            OnFatalDecodeError();
             value = Array.Empty<byte>();
             return false;
         }
@@ -798,6 +800,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
     public bool TryReadStruct(Tdf val)
     {
+        using var nesting = EnterNesting();
         ITdfMember[] members = val.GetMembers();
         int currentMember = 0;
 
@@ -898,6 +901,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
         return (Heat2Reader reader, out IList<T> value, bool _) =>
         {
+            using var nesting = reader.EnterNesting();
             RestorePoint checkpoint = reader.CreateRestorePoint();
 
             if(!reader.TryReadHeat2Type(out Heat2Type type))
@@ -906,8 +910,9 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
                 return false;
             }
 
-            if (!reader.TryReadVarInt(out long count) || count < 0)
+            if (!reader.TryReadVarInt(out long count) || count < 0 || count > 16384 || (reader.Stream.CanSeek && count > reader.Stream.Length - reader.Stream.Position))
             {
+                reader.OnFatalDecodeError();
                 value = new List<T>();
                 return false;
             };
@@ -924,6 +929,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
                 return false;
             }
 
+            reader.ChargeWork((int)count);
             value = new List<T>((int)count);
 
             for (long i = 0; i < count; i++)
@@ -940,14 +946,16 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
     public static bool TryReadUnknownList(Heat2Reader reader, out IList value, bool _)
     {
+        using var nesting = reader.EnterNesting();
         if(!reader.TryReadHeat2Type(out Heat2Type itemType))
         {
             value = new List<object>();
             return false;
         }
 
-        if (!reader.TryReadVarInt(out long count) || count < 0)
+        if (!reader.TryReadVarInt(out long count) || count < 0 || count > 16384 || (reader.Stream.CanSeek && count > reader.Stream.Length - reader.Stream.Position))
         {
+            reader.OnFatalDecodeError();
             value = new List<object>();
             return false;
         };
@@ -957,9 +965,10 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
         bool tryReadList(Heat2Type listItemType, out IList list)
         {
             reader.RestoreTo(listStartPoint);
+            reader.ChargeWork((int)count);
             list = Heat2Util.CreateListOfType(listItemType);
 
-            TypeReader itemReader = GetTypeReader(itemType);
+            TypeReader itemReader = GetTypeReader(listItemType);
             for (long i = 0; i < count; i++)
             {
                 if (!itemReader(reader, out object? item, visitHeader: false))
@@ -1036,6 +1045,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
         return (Heat2Reader reader, out IDictionary<TKey, TValue> value, bool _) =>
         {
+            using var nesting = reader.EnterNesting();
             RestorePoint rp = reader.CreateRestorePoint();
 
             if(!reader.TryReadHeat2Type(out Heat2Type keyType))
@@ -1064,12 +1074,14 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
                 return false;
             }
 
-            if (!reader.TryReadVarInt(out long count) || count < 0)
+            if (!reader.TryReadVarInt(out long count) || count < 0 || count > 16384 || (reader.Stream.CanSeek && count > reader.Stream.Length - reader.Stream.Position))
             {
+                reader.OnFatalDecodeError();
                 value = new SortedDictionary<TKey, TValue>();
                 return false;
             };
 
+            reader.ChargeWork(checked((int)count * 2));
             value = new SortedDictionary<TKey, TValue>();
 
             // Read the rest of the map
@@ -1081,6 +1093,11 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
                 if (!valueReader(reader, out TValue val, visitHeader: true))
                     return false;
 
+                if (value.ContainsKey(key))
+                {
+                    reader.OnFatalDecodeError();
+                    return false;
+                }
                 value.Add(key, val);
             }
 
@@ -1090,6 +1107,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
     public static bool TryReadUnknownMap(Heat2Reader reader, out IDictionary value, bool _)
     {
+        using var nesting = reader.EnterNesting();
         if (!reader.TryReadHeat2Type(out Heat2Type keyType))
         {
             value = new SortedDictionary<object, object>();
@@ -1102,12 +1120,14 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
             return false;
         }
 
-        if (!reader.TryReadVarInt(out long count) || count < 0)
+        if (!reader.TryReadVarInt(out long count) || count < 0 || count > 16384 || (reader.Stream.CanSeek && count > reader.Stream.Length - reader.Stream.Position))
         {
+            reader.OnFatalDecodeError();
             value = new SortedDictionary<object, object>();
             return false;
         };
 
+        reader.ChargeWork(checked((int)count * 2));
         value = Heat2Util.CreateDictionaryOfType(keyType, valueType);
         TypeReader keyReader = GetTypeReader(keyType);
         TypeReader valueReader = GetTypeReader(valueType);
@@ -1120,6 +1140,11 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
             if (!valueReader(reader, out object? val, visitHeader: true))
                 return false;
 
+            if (key == null || value.Contains(key))
+            {
+                reader.OnFatalDecodeError();
+                return false;
+            }
             value.Add(key, val);
         }
 
@@ -1143,6 +1168,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
     public bool TryReadUnion(Union val, bool visitHeader)
     {
+        using var nesting = EnterNesting();
         int activeIndex = Stream.ReadByte();
         if (activeIndex == -1)
         {
@@ -1177,6 +1203,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
     
     public bool TryReadVariable(out object? val)
     {
+        using var nesting = EnterNesting();
         bool tryReadBool(out bool result)
         {
             
@@ -1192,10 +1219,15 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
             return true;
         }
 
-        if(!tryReadBool(out bool present) || !present)
+        if (!tryReadBool(out bool present))
         {
             val = null;
             return false;
+        }
+        if (!present)
+        {
+            val = null;
+            return true;
         }
 
         //int present = Stream.ReadByte();
@@ -1238,7 +1270,9 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
             }
 
             val = tdf;
-            return tryReadBool(out bool terminator1) && !terminator1;
+            bool terminated = tryReadBool(out bool terminator1) && !terminator1;
+            if (!terminated) OnFatalDecodeError();
+            return terminated;
         }
 
 
@@ -1257,7 +1291,9 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
         }
 
         val = member.GetValue();
-        return tryReadBool(out bool terminator2) && !terminator2;
+        bool validTerminator = tryReadBool(out bool terminator2) && !terminator2;
+        if (!validTerminator) OnFatalDecodeError();
+        return validTerminator;
     }
 
 
@@ -1380,8 +1416,11 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
         RestoreTo(rp);
 
+        if (++_unknownMembers > 16384) throw new InvalidDataException("Too many unknown TDF members.");
         parent.GetUnknownMembers().Add(member);
-        return member.Visit(Decoder, parent, visitHeader: true);
+        bool visited = member.Visit(Decoder, parent, visitHeader: true);
+        if (!visited) OnFatalDecodeError();
+        return visited;
     }
 
     ITdfMember? createNewMemberFromHeader(Heat2MemberHeader header)
@@ -1409,6 +1448,7 @@ internal class Heat2Reader(Heat2Decoder decoder, Stream stream)
 
     public bool TryReadHeat2Type(out Heat2Type type)
     {
+        ChargeWork();
         int b = Stream.ReadByte();
         if (b == -1)
         {

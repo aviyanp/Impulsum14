@@ -1,4 +1,7 @@
 using System.Net;
+using System.Runtime.InteropServices;
+using System.Runtime.Loader;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Blaze.Core;
 using EATDF.Serialization;
@@ -9,93 +12,104 @@ namespace Impulsum14;
 
 internal static class Program
 {
-    private static int RedirPort => EnvInt("FIFA14_REDIR_PORT", 42127);
-    private static int BlazePort => EnvInt("FIFA14_BLAZE_PORT", 10000);
-    private static int WebPort => EnvInt("FIFA14_WEB_PORT", 9988);
-    private static bool Fire2 => Environment.GetEnvironmentVariable("FIFA14_FIRE2") == "1";
-
-    // FIFA 14's wire = Fire (v1) framing but Heat2 TDF encoding (confirmed by capturing
-    // getServerInstance: integer type-byte=0x00, union=0x06 -> Heat2Type, and the 183-byte
-    // body decoded cleanly). Heat2 is the default; set FIFA14_HEAT1=1 to force the old Heat1.
-
-    private static bool Heat1 => Environment.GetEnvironmentVariable("FIFA14_HEAT1") == "1";
-
-    private static async Task Main()
+    private static async Task<int> Main(string[] args)
     {
-        using var loggerFactory = LoggerFactory.Create(b => b
-            .AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; })
-            .AddFilter(null, LogLevel.Debug));
-        var log = loggerFactory.CreateLogger("Impulsum14");
-
-        var cert = LoadCert(log);
-        var protoCert = ProtoSSLCertificate.FromX509Certificate2(cert);
-        var callbacks = new ServerCallbacks(protoCert, loggerFactory.CreateLogger("Blaze"));
-
-        var enc = Fire2 ? FrameEncoding.Fire2 : FrameEncoding.Fire;
-        TdfSerializer serializer = Heat1 ? new HeatSerializer() : new Heat2Serializer();
-        log.LogInformation("Encoding: {0} framing + {1} TDF", enc, serializer.Name);
-
-        var redirRouter = new BlazeRouter();
-        redirRouter.AddComponent(new RedirectorComponent(BlazePort, loggerFactory.CreateLogger("Redirector")));
-        var redirServer = new BlazeServer(MakeConfig(RedirPort, enc, serializer, redirRouter, protoCert, callbacks, secure: true),
-            loggerFactory.CreateLogger<BlazeServer>());
-
-        // OSDK web service
-        var webBaseUrl = $"http://127.0.0.1:{WebPort}";
-        var webServer = new WebServer(WebPort, loggerFactory.CreateLogger("Web"));
-
-        // Main Blaze server
-        var blazeRouter = new BlazeRouter();
-        blazeRouter.AddComponent(new UtilComponent(loggerFactory.CreateLogger("Util"), webBaseUrl));
-        blazeRouter.AddComponent<AuthenticationComponent>();
-        blazeRouter.AddComponent<UserSessionsComponent>();
-        blazeRouter.AddComponent<CensusDataComponent>();
-        blazeRouter.AddComponent<AssociationListsComponent>();
-        blazeRouter.AddComponent<MessagingComponent>();
-        blazeRouter.AddComponent<RoomsComponent>();
-        blazeRouter.AddComponent<StatsComponent>();
-        blazeRouter.AddComponent<ClubsComponent>();
-        blazeRouter.AddComponent(new SponsoredEventsComponent()); 
-        blazeRouter.AddComponent(new OsdkSettingsComponent()); 
-        var blazeServer = new BlazeServer(MakeConfig(BlazePort, enc, serializer, blazeRouter, protoCert, callbacks, secure: false),
-            loggerFactory.CreateLogger<BlazeServer>());
-
-        log.LogInformation("Impulsum14 starting: redirector :{0} -> blaze :{1}, web :{2}", RedirPort, BlazePort, WebPort);
-        Market.WarmUp();
-        webServer.StartBotMarketLoop();
-        await Task.WhenAll(redirServer.StartAsync(), blazeServer.StartAsync(), webServer.StartAsync());
-        await Task.Delay(Timeout.Infinite);
-    }
-
-    private static BlazeServerConfig MakeConfig(int port, FrameEncoding enc, TdfSerializer serializer,
-        BlazeRouter router, ProtoSSLCertificate cert, ServerCallbacks callbacks, bool secure) => new()
-    {
-        LocalEndpoint = new IPEndPoint(IPAddress.Loopback, port),
-        PacketFrameEncoding = enc,
-        Serializer = serializer,
-        Secure = secure,
-        Certificate = secure ? cert : null,
-        CallbackHandler = callbacks,
-        Router = router,
-    };
-
-    private static X509Certificate2 LoadCert(ILogger log)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 6; i++)
+        try
         {
-            var pfx = Path.Combine(dir, "certs", "server.pfx");
-            if (File.Exists(pfx))
+            if (args.Contains("--hash-token"))
             {
-                var c = new X509Certificate2(pfx, (string)null,
-                    X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
-                log.LogInformation("Loaded cert {0}", c.Subject);
-                return c;
+                Console.WriteLine(Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(Console.ReadLine() ?? ""))));
+                return 0;
             }
-            dir = Directory.GetParent(dir)?.FullName ?? dir;
+            ServerOptions.Current = ServerOptions.Load();
+            var options = ServerOptions.Current;
+            if (args.Contains("--validate-config")) { Console.WriteLine("Configuration valid."); return 0; }
+            using var loggerFactory = LoggerFactory.Create(b => b
+                .AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; })
+                .SetMinimumLevel(Enum.Parse<LogLevel>(options.LogLevel, true)));
+            var log = loggerFactory.CreateLogger("Impulsum14");
+            if (args.Contains("--bridge")) return await RunBridgeAsync(options, loggerFactory);
+            using var repository = new PlayerRepository();
+            using var ranked = new RankedService(options.DataDirectory, options.Ranked);
+            RankedService.Current = ranked;
+            using var cert = new X509Certificate2(options.CertificatePath, Environment.GetEnvironmentVariable("FIFA14_CERTIFICATE_PASSWORD"), X509KeyStorageFlags.Exportable | X509KeyStorageFlags.EphemeralKeySet);
+            var protoCert = ProtoSSLCertificate.FromX509Certificate2(cert);
+            var callbacks = new ServerCallbacks(protoCert, loggerFactory.CreateLogger("Blaze"));
+            var encoding = Environment.GetEnvironmentVariable("FIFA14_FIRE2") == "1" ? FrameEncoding.Fire2 : FrameEncoding.Fire;
+            TdfSerializer serializer = Environment.GetEnvironmentVariable("FIFA14_HEAT1") == "1" ? new HeatSerializer() : new Heat2Serializer();
+            var redirector = new BlazeRouter();
+            redirector.AddComponent(new RedirectorComponent(options.BlazePort, loggerFactory.CreateLogger("Redirector")));
+            var redirServer = new BlazeServer(MakeConfig(options.RedirectorPort, true, redirector), loggerFactory.CreateLogger<BlazeServer>());
+            var router = new BlazeRouter();
+            router.AddComponent(new UtilComponent(loggerFactory.CreateLogger("Util"), options.PublicWebUrl));
+            router.AddComponent<AuthenticationComponent>();
+            router.AddComponent<UserSessionsComponent>();
+            router.AddComponent<CensusDataComponent>();
+            router.AddComponent<AssociationListsComponent>();
+            router.AddComponent<MessagingComponent>();
+            router.AddComponent<RoomsComponent>();
+            router.AddComponent<StatsComponent>();
+            router.AddComponent<ClubsComponent>();
+            router.AddComponent(new SponsoredEventsComponent());
+            router.AddComponent(new OsdkSettingsComponent());
+            router.AddComponent<GameReportingComponent>();
+            router.AddComponent(new GameManagerComponent(ranked));
+            var blazeServer = new BlazeServer(MakeConfig(options.BlazePort, false, router), loggerFactory.CreateLogger<BlazeServer>());
+            var web = new WebServer(options.WebPort, loggerFactory.CreateLogger("Web"));
+            Legends.ValidateClientManifest();
+            if (RealPlayers.All.Length == 0) throw new InvalidDataException("Player database is empty or missing.");
+            Market.WarmUp();
+            using var shutdown = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
+            AssemblyLoadContext.Default.Unloading += _ => SafeCancel(shutdown);
+            using var signal = OperatingSystem.IsWindows() ? null : PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; shutdown.Cancel(); });
+            var tasks = new[] { redirServer.StartAsync(shutdown.Token), blazeServer.StartAsync(shutdown.Token), web.StartAsync(shutdown.Token) };
+            log.LogInformation("Listening on {Bind}; advertising {Host}, web {Web}. Maintenance scheduler {TickRate} Hz.", options.BindAddress, options.AdvertisedAddress, options.PublicWebUrl, options.TickRate);
+            await Task.WhenAny(tasks);
+            shutdown.Cancel();
+            try { await Task.WhenAll(tasks); }
+            catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { }
+            return 0;
+
+            BlazeServerConfig MakeConfig(int port, bool secure, BlazeRouter r) => new()
+            {
+                LocalEndpoint = new IPEndPoint(IPAddress.Parse(options.BindAddress), port),
+                PacketFrameEncoding = encoding, Serializer = serializer, Secure = secure,
+                Certificate = secure ? protoCert : null, CallbackHandler = callbacks, Router = r,
+                Backlog = 512, MaxConnections = options.MaxConnections, MaxFrameBytes = options.MaxBodyBytes,
+                IdleTimeoutSeconds = options.IdleTimeoutSeconds, SendTimeoutSeconds = options.SendTimeoutSeconds,
+                InboundQueueCapacity = options.InboundQueueCapacity, OutboundQueueCapacity = options.OutboundQueueCapacity,
+                CommandMiddleware = repository.RunRpcAsync
+            };
         }
-        throw new FileNotFoundException("certs/server.pfx not found.");
+        catch (Exception ex) { Console.Error.WriteLine($"Server stopped: {ex.Message}"); return 1; }
+    }
+    private static async Task<int> RunBridgeAsync(ServerOptions options, ILoggerFactory logging)
+    {
+        if (Environment.GetEnvironmentVariable("FIFA14_FIRE2") == "1" || Environment.GetEnvironmentVariable("FIFA14_HEAT1") == "1") throw new InvalidDataException("PC bridge uses Fire + Heat2.");
+        string tokenFile = Environment.GetEnvironmentVariable("FIFA14_UPSTREAM_TOKEN_FILE");
+        string token = tokenFile is not null ? File.ReadAllText(tokenFile).Trim() : Environment.GetEnvironmentVariable("FIFA14_UPSTREAM_TOKEN");
+        string upstreamWeb = Environment.GetEnvironmentVariable("FIFA14_UPSTREAM_WEB_URL") ?? throw new InvalidDataException("Set FIFA14_UPSTREAM_WEB_URL.");
+        string upstreamBlaze = Environment.GetEnvironmentVariable("FIFA14_UPSTREAM_BLAZE_HOST") ?? new Uri(upstreamWeb).Host;
+        int upstreamPort = int.TryParse(Environment.GetEnvironmentVariable("FIFA14_UPSTREAM_BLAZE_PORT"), out int p) ? p : 10000;
+        var bridge = new ClientBridge(options, upstreamWeb, upstreamBlaze, upstreamPort, token);
+        using var cert = new X509Certificate2(options.CertificatePath, Environment.GetEnvironmentVariable("FIFA14_CERTIFICATE_PASSWORD"), X509KeyStorageFlags.Exportable | X509KeyStorageFlags.EphemeralKeySet);
+        var proto = ProtoSSLCertificate.FromX509Certificate2(cert);
+        var router = new BlazeRouter(); router.AddComponent(new RedirectorComponent(options.BlazePort, logging.CreateLogger("Redirector")));
+        var redirector = new BlazeServer(new BlazeServerConfig { LocalEndpoint = new IPEndPoint(IPAddress.Parse(options.BindAddress), options.RedirectorPort), Router = router, Secure = true, CallbackHandler = new ServerCallbacks(proto, logging.CreateLogger("Bridge")), MaxConnections = 64 }, logging.CreateLogger<BlazeServer>());
+        using var stop = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
+        AssemblyLoadContext.Default.Unloading += _ => SafeCancel(stop);
+        using var signal = OperatingSystem.IsWindows() ? null : PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; stop.Cancel(); });
+        var tasks = new[] { redirector.StartAsync(stop.Token), bridge.StartBlazeAsync(stop.Token), bridge.StartWebAsync(stop.Token) };
+        await Task.WhenAny(tasks); stop.Cancel();
+        try { await Task.WhenAll(tasks); } catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        return 0;
     }
 
-    private static int EnvInt(string name, int dflt) => int.TryParse(Environment.GetEnvironmentVariable(name), out var v) ? v : dflt;
+    private static void SafeCancel(CancellationTokenSource source)
+    {
+        try { source.Cancel(); } catch (ObjectDisposedException) { }
+    }
+
 }

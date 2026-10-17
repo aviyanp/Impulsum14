@@ -115,13 +115,13 @@ internal class HeatWriter(HeatEncoder encoder, Stream stream)
         if (Helpers.IsList(type))
         {
             Type[] typeArgs = type.GetGenericArguments();
-            return (TypeWriter<T>)_createListWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, null)!;
+            return (TypeWriter<T>)_createListWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, new object[] { type })!;
         }
 
         if (Helpers.IsDictionary(type))
         {
             Type[] typeArgs = type.GetGenericArguments();
-            return (TypeWriter<T>)_createMapWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, null)!;
+            return (TypeWriter<T>)_createMapWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, new object[] { type })!;
         }
 
         // Unknown type :(

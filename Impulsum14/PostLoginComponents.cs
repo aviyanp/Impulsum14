@@ -12,7 +12,7 @@ internal sealed class UserSessionsComponent : UserSessionsBase.Server
 {
     public override Task<EmptyMessage> UpdateNetworkInfoAsync(NetworkInfo request, BlazeRpcContext context)
     {
-        Console.WriteLine("[UserSessions] updateNetworkInfo");
+        ServerDiagnostics.Write("[UserSessions] updateNetworkInfo");
         return Task.FromResult(new EmptyMessage());
     }
 }
@@ -22,13 +22,13 @@ internal sealed class CensusDataComponent : CensusDataComponentBase.Server
 {
     public override Task<EmptyMessage> SubscribeToCensusDataAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[CensusData] subscribe");
+        ServerDiagnostics.Write("[CensusData] subscribe");
         return Task.FromResult(new EmptyMessage());
     }
 
     public override Task<EmptyMessage> UnsubscribeFromCensusDataAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[CensusData] unsubscribe");
+        ServerDiagnostics.Write("[CensusData] unsubscribe");
         return Task.FromResult(new EmptyMessage());
     }
 }
@@ -38,7 +38,7 @@ internal sealed class AssociationListsComponent : AssociationListsComponentBase.
 {
     public override Task<Lists> GetListsAsync(GetListsRequest request, BlazeRpcContext context)
     {
-        Console.WriteLine("[AssocLists] getLists");
+        ServerDiagnostics.Write("[AssocLists] getLists");
         return Task.FromResult(new Lists { ListMembersVector = new List<ListMembers>() });
     }
 }
@@ -48,7 +48,7 @@ internal sealed class MessagingComponent : MessagingComponentBase.Server
 {
     public override Task<EmptyMessage> FetchMessagesAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Messaging] fetchMessages");
+        ServerDiagnostics.Write("[Messaging] fetchMessages");
         return Task.FromResult(new EmptyMessage());
     }
 
@@ -74,7 +74,7 @@ internal sealed class StatsComponent : StatsComponentBase.Server
 {
     public override Task<KeyScopes> GetKeyScopesMapAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Stats] getKeyScopesMap");
+        ServerDiagnostics.Write("[Stats] getKeyScopesMap");
         return Task.FromResult(new KeyScopes { KeyScopesMap = new Dictionary<string, KeyScopeItem>() });
     }
 
@@ -90,7 +90,7 @@ internal sealed class ClubsComponent : ClubsComponentBase.Server
 {
     public override Task<EmptyMessage> GetClubsComponentSettingsAsync(EmptyMessage request, BlazeRpcContext context)
     {
-        Console.WriteLine("[Clubs] getClubsComponentSettings");
+        ServerDiagnostics.Write("[Clubs] getClubsComponentSettings");
         return Task.FromResult(new EmptyMessage());
     }
 

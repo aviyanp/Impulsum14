@@ -4,9 +4,8 @@ namespace Impulsum14;
 
 internal static class ClientDataStore
 {
-    private static readonly object _lock = new();
-    private static readonly string _path = Path.Combine(AppContext.BaseDirectory, "Profile", "clientdata.json");
-    private static readonly Dictionary<string, string> _data = Load();
+    private static object _lock => PlayerContext.Current.Sync;
+    private static Dictionary<string, string> _data => PlayerContext.Current.Data.ClientData;
 
     public static string Get(string key)
     {
@@ -17,6 +16,7 @@ internal static class ClientDataStore
     {
         lock (_lock)
         {
+            if (key.Length > 128 || json.Length > 65536 || (_data.Count >= 128 && !_data.ContainsKey(key))) throw new InvalidDataException("Client data limits exceeded.");
             _data[key] = string.IsNullOrWhiteSpace(json) ? "{}" : json;
             Save();
         }
@@ -31,31 +31,5 @@ internal static class ClientDataStore
         }
     }
 
-    private static Dictionary<string, string> Load()
-    {
-        try
-        {
-            if (File.Exists(_path))
-                return JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(_path))
-                       ?? new Dictionary<string, string>();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ClientData] failed to load {_path}, using defaults: {ex.GetType().Name}: {ex.Message}");
-        }
-        return new Dictionary<string, string>();
-    }
-
-    private static void Save()
-    {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            File.WriteAllText(_path, JsonSerializer.Serialize(_data));
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ClientData] failed to save {_path}: {ex.GetType().Name}: {ex.Message}");
-        }
-    }
+    private static void Save() => PlayerContext.MarkDirty();
 }

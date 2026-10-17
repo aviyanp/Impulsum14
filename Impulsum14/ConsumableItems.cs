@@ -42,11 +42,11 @@ internal static class ConsumableItems
         }
         catch (FileNotFoundException)
         {
-            Console.WriteLine($"[Consumables] no {path}, running without consumables (set FUT_PROBE_CONSUMABLES to probe)");
+            ServerDiagnostics.Write($"[Consumables] no {path}, running without consumables (set FUT_PROBE_CONSUMABLES to probe)");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Consumables] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[Consumables] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
         }
         return list.ToArray();
     }
@@ -56,14 +56,14 @@ internal static class ConsumableItems
         int from = 5003043, to = 5003100;
         var list = new List<ConsumableItem>();
         long id = ConsumableItemIdBase;
-        Console.WriteLine($"[Consumables] PROBE modifier hunt {from}..{to} (read tab left-to-right):");
+        ServerDiagnostics.Write($"[Consumables] PROBE modifier hunt {from}..{to} (read tab left-to-right):");
         int n = 0;
         for (int r = from; r <= to; r++, n++)
         {
             list.Add(new ConsumableItem(id++, "healing", 0, r, 0, $"probe #{n}"));
-            Console.WriteLine($"   card #{n,2}: resourceId {r}");
+            ServerDiagnostics.Write($"   card #{n,2}: resourceId {r}");
         }
-        Console.WriteLine($"[Consumables] PROBE seeded {list.Count} modifier-hunt cards");
+        ServerDiagnostics.Write($"[Consumables] PROBE seeded {list.Count} modifier-hunt cards");
         return list;
     }
 
@@ -95,11 +95,11 @@ internal static class ConsumableItems
         }
         catch (FileNotFoundException)
         {
-            Console.WriteLine($"[Consumables] no {path}; consumable effects will use approximations");
+            ServerDiagnostics.Write($"[Consumables] no {path}; consumable effects will use approximations");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Consumables] modifier table load failed: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[Consumables] modifier table load failed: {ex.GetType().Name}: {ex.Message}");
         }
         return dict;
     }

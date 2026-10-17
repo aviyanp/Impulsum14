@@ -73,8 +73,8 @@ internal class Heat2Writer(Heat2Encoder encoder, Stream stream)
         //[typeof(IDictionary)] = new TypeWriter<IDictionary>(WriteUnknownMap),
     };
 
-    static MethodInfo _createListWriterMethod = typeof(HeatWriter).GetMethod(nameof(createListTypeWriter), BindingFlags.NonPublic | BindingFlags.Static)!;
-    static MethodInfo _createMapWriterMethod = typeof(HeatWriter).GetMethod(nameof(createMapTypeWriter), BindingFlags.NonPublic | BindingFlags.Static)!;
+    static MethodInfo _createListWriterMethod = typeof(Heat2Writer).GetMethod(nameof(createListTypeWriter), BindingFlags.NonPublic | BindingFlags.Static)!;
+    static MethodInfo _createMapWriterMethod = typeof(Heat2Writer).GetMethod(nameof(createMapTypeWriter), BindingFlags.NonPublic | BindingFlags.Static)!;
 
     /// <summary>
     /// Returns the writer for the specified type.
@@ -115,13 +115,13 @@ internal class Heat2Writer(Heat2Encoder encoder, Stream stream)
         if (Helpers.IsList(type))
         {
             Type[] typeArgs = type.GetGenericArguments();
-            return (TypeWriter<T>)_createListWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, null)!;
+            return (TypeWriter<T>)_createListWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, new object[] { type })!;
         }
 
         if (Helpers.IsDictionary(type))
         {
             Type[] typeArgs = type.GetGenericArguments();
-            return (TypeWriter<T>)_createMapWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, null)!;
+            return (TypeWriter<T>)_createMapWriterMethod.MakeGenericMethod(typeArgs).Invoke(null, new object[] { type })!;
         }
 
         // Unknown type :(

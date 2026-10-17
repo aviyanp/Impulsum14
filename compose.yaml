@@ -1,0 +1,27 @@
+services:
+  server:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "42127:42127/tcp"
+      - "10000:10000/tcp"
+      - "9988:9988/tcp"
+    volumes:
+      - ./deploy/server.json:/config/server.json:ro
+      - ./deploy/accounts.json:/config/accounts.json:ro
+      - player-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  player-data:

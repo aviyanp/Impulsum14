@@ -1,4 +1,4 @@
-﻿using EATDF.Heat;
+using EATDF.Heat;
 using EATDF.Types;
 using System;
 using System.Collections;
@@ -127,11 +127,11 @@ internal class Heat2Util
             case Heat2Type.Struct:
                 return type.IsSubclassOf(typeof(Tdf));
             case Heat2Type.List:
-                return Helpers.IsList(type);
+                return type == typeof(IList) || Helpers.IsList(type);
             case Heat2Type.Map:
-                return Helpers.IsDictionary(type);
+                return type == typeof(IDictionary) || Helpers.IsDictionary(type);
             case Heat2Type.Union:
-                return type.IsSubclassOf(typeof(Union));
+                return typeof(Union).IsAssignableFrom(type);
             case Heat2Type.Variable:
                 return type == typeof(object);
             case Heat2Type.BlazeObjectType:
@@ -168,16 +168,16 @@ internal class Heat2Util
         }
 
         // union must be before tdf, because union is a subclass of tdf
-        if (type.IsSubclassOf(typeof(Union)))
+        if (typeof(Union).IsAssignableFrom(type))
             return Heat2Type.Union;
 
         if (type.IsSubclassOf(typeof(Tdf)))
             return Heat2Type.Struct;
 
-        if (Helpers.IsList(type))
+        if (type == typeof(IList) || Helpers.IsList(type))
             return Heat2Type.List;
 
-        if (Helpers.IsDictionary(type))
+        if (type == typeof(IDictionary) || Helpers.IsDictionary(type))
             return Heat2Type.Map;
 
         if (type == typeof(byte[]))

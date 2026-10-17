@@ -1,4 +1,4 @@
-﻿using EATDF;
+using EATDF;
 using EATDF.Serialization;
 using EATDF.Types;
 using Microsoft.Extensions.Logging;
@@ -80,30 +80,33 @@ namespace Blaze.Core.Internal
             BlazeRpcConnection rpcConnection = getBlazeRpcConnection(connection);
             rpcConnection.LastActivityTime = DateTime.UtcNow;
 
-            // Decode Fire2 metadata (context, error code, session key, etc.)
-            if (packet is ProtoFire2Packet fire2Packet && fire2Packet.MetadataData.Length > 0)
-            {
-                decodeFire2Metadata(fire2Packet);
-            }
-
-            await rpcConnection.BusyLock.EnterAsync();
-
+            rpcConnection.BeginRequest();
             try
             {
+                if (packet is ProtoFire2Packet fire2Packet && fire2Packet.MetadataData.Length > 0)
+                    decodeFire2Metadata(fire2Packet);
+
                 Task task = packet.Frame.MessageType switch
                 {
                     MessageType.Message => onMessagePacketAsync(rpcConnection, packet),
-                    MessageType.Ping => onPingPacketAsync(rpcConnection, packet),
+                    MessageType.Ping when packet.Frame.Type == FrameType.Fire2Frame => onPingPacketAsync(rpcConnection, packet),
                     _ => _handler.OnUnhandledAsync(rpcConnection, packet, false)
                 };
-
                 await task.ConfigureAwait(false);
             }
-            finally
+            catch (Exception ex)
             {
-                rpcConnection.BusyLock.Exit();
+                await OnErrorAsync(rpcConnection, ex).ConfigureAwait(false);
+                if (packet.Frame.MessageType == MessageType.Message)
+                {
+                    IFireFrame errorFrame = packet.Frame.CreateResponseFrame(0x4001); // ERR_SYSTEM
+                    ProtoFirePacket errorPacket = errorFrame is Fire2Frame fire2
+                        ? new ProtoFire2Packet(fire2, encodeFire2Metadata(fire2, 0), Array.Empty<byte>())
+                        : new ProtoFirePacket(errorFrame, Array.Empty<byte>());
+                    await rpcConnection.SendAsync(errorPacket).ConfigureAwait(false);
+                }
             }
-
+            finally { rpcConnection.EndRequest(); }
         }
 
         public Task OnPacketSentAsync(ProtoFireConnection connection, ProtoFirePacket packet)
@@ -170,6 +173,8 @@ namespace Blaze.Core.Internal
             BlazeRpcContext context = new BlazeRpcContext()
             {
                 Connection = rpcConnection,
+                CancellationToken = rpcConnection.CancellationToken,
+                ComponentId = packet.Frame.Component,
                 Context = packet.Frame.Context,
                 ErrorCode = packet.Frame.ErrorCode,
                 MessageNum = packet.Frame.MessageNum,
@@ -180,7 +185,9 @@ namespace Blaze.Core.Internal
             ushort errorCode = 0;
             try
             {
-                rpcResult = await commandFunc.InvokeAsync(requestTdf, context).ConfigureAwait(false);
+                rpcResult = config.CommandMiddleware is null
+                    ? await commandFunc.InvokeAsync(requestTdf, context).ConfigureAwait(false)
+                    : await config.CommandMiddleware(context, requestTdf, () => commandFunc.InvokeAsync(requestTdf, context)).ConfigureAwait(false);
             }
             catch (BlazeRpcException blazeException)
             {
@@ -192,7 +199,8 @@ namespace Blaze.Core.Internal
                 Task t1 = OnErrorAsync(rpcConnection, ex);
                 Task t2 = _handler.OnRpcCommandErrorAsync(rpcConnection, packet, requestTdf, ex);
                 await Task.WhenAll(t1, t2).ConfigureAwait(false);
-                return;
+                rpcResult = null;
+                errorCode = 0x4001; // ERR_SYSTEM: every decoded command receives a terminal response.
             }
             
             IFireFrame responseFrame = packet.Frame.CreateResponseFrame(errorCode);
@@ -259,6 +267,8 @@ namespace Blaze.Core.Internal
 
         void logPacket(BlazeRpcConnection connection, ProtoFirePacket packet, Tdf? deserializedContent, bool inbound)
         {
+            if (!logger.IsEnabled(LogLevel.Debug) && config.PacketLogger is null) return;
+            if (packet.Frame.Component == 1) deserializedContent = null; // Authentication payloads contain credentials.
             IBlazeComponent? component = _router.GetComponent(packet.Frame.Component);
             string componentName;
             string commandName;

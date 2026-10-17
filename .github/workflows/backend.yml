@@ -1,0 +1,24 @@
+name: Backend checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet build tests/Impulsum14.Tests/Impulsum14.Tests.csproj -c Release --nologo
+      - run: dotnet tests/Impulsum14.Tests/bin/Release/net8.0/Impulsum14.Tests.dll
+      - run: dotnet publish Impulsum14/Impulsum14.csproj -c Release --no-self-contained -o artifacts/server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.os }}
+          path: artifacts/server

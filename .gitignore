@@ -25,3 +25,21 @@ packages/
 
 # Logs
 *.log
+
+# Runtime identities, private configuration and state
+Impulsum14/Profile/players/
+Impulsum14/Profile/ranked/
+Impulsum14/Profile/.server.lock
+Impulsum14/Profile/*.tmp
+Impulsum14/Profile/fut_profile.json
+Impulsum14/Profile/club_data*.json
+Impulsum14/Profile/account.json
+Impulsum14/Profile/clientdata.json
+deploy/server.json
+deploy/accounts.json
+server.json
+*.token
+artifacts/
+
+__pycache__/
+*.pyc

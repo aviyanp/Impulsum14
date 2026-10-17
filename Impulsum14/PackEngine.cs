@@ -108,6 +108,17 @@ internal static class PackEngine
             }
         }
 
+        if (ServerOptions.Current.EnableLegends && rnd.NextDouble() < ServerOptions.Current.LegendChance)
+        {
+            var candidates = Enumerable.Range(0, slots.Count).Where(i => slots[i].Type == ItemTypes.Player && (slots[i].ForcedTier ?? slots[i].Tier) == PackConfig.Gold && slots[i].Rare).ToArray();
+            if (candidates.Length > 0)
+            {
+                int target = candidates[rnd.Next(candidates.Length)];
+                picks[target] = PackPick.OfPlayer(PackLottery.Draw(Legends.Catalog, p => Math.Max(1, 100 - p.Rating), rnd));
+                isSpec[target] = true; gotSpecial = true;
+            }
+        }
+
         if (gotSpecial)
         {
             int cap = int.MaxValue;
@@ -163,7 +174,7 @@ internal static class PackEngine
         int rares = System.Math.Min(cls.Rare, eligible.Count);
         for (int i = 0; i < rares; i++) eligible[i].Rare = true;
         if (rares < cls.Rare)
-            System.Console.WriteLine($"[Pack] {def.Size}-item pack wanted {cls.Rare} rares but only " +
+            ServerDiagnostics.Write($"[Pack] {def.Size}-item pack wanted {cls.Rare} rares but only " +
                                      $"{eligible.Count} slots are rare-eligible");
 
         Shuffle(slots, rnd);

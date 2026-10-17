@@ -10,7 +10,7 @@ namespace Impulsum14;
 internal sealed class UtilComponent : UtilComponentBase.Server
 {
     private readonly ILogger _log;
-    private const string GameIp = "127.0.0.1";
+    private static string GameIp => ServerOptions.Current.AdvertisedAddress;
     private readonly string _web; // base URL
 
     // EA's real FIFA 14 asset CDN. Keep static content here until we mirror it locally.
@@ -58,7 +58,7 @@ internal sealed class UtilComponent : UtilComponentBase.Server
     public override Task<PingResponse> PingAsync(EmptyMessage request, BlazeRpcContext context)
         => Task.FromResult(new PingResponse { ServerTime = Now() });
 
-    private static readonly Dictionary<string, string> UserSettings = new() { ["FirstTimeFlag"] = "0" };
+    private static Dictionary<string, string> UserSettings => PlayerContext.Current.Data.UserSettings;
 
     public override Task<UserSettingsLoadAllResponse> UserSettingsLoadAllAsync(UserSettingsLoadAllRequest request, BlazeRpcContext context)
         => Task.FromResult(new UserSettingsLoadAllResponse { DataMap = new Dictionary<string, string>(UserSettings) });
@@ -68,7 +68,10 @@ internal sealed class UtilComponent : UtilComponentBase.Server
 
     public override Task<EmptyMessage> UserSettingsSaveAsync(UserSettingsSaveRequest request, BlazeRpcContext context)
     {
-        _log.LogInformation("userSettingsSave key='{0}' data='{1}' (ignored)", request.Key, request.Data);
+        if (string.IsNullOrEmpty(request.Key) || request.Key.Length > 128 || (request.Data?.Length ?? 0) > 65536 || (UserSettings.Count >= 128 && !UserSettings.ContainsKey(request.Key)))
+            throw new BlazeRpcException(4, null, "User settings limit exceeded.");
+        UserSettings[request.Key] = request.Data ?? "";
+        PlayerContext.MarkDirty();
         return Task.FromResult(new EmptyMessage());
     }
 

@@ -41,7 +41,7 @@ internal static class UserSessionsNotifications
 
     public static Task SendUserAuthenticatedAsync(BlazeRpcConnection connection, long blazeId, bool subscribed = true)
     {
-        return connection.SendAsync(packet =>
+        connection.EnqequeSend(packet =>
         {
             IFireFrame frame = packet.Frame;
             frame.Component = UserSessionsBase.Id; // 30722
@@ -49,5 +49,6 @@ internal static class UserSessionsNotifications
             frame.MessageType = MessageType.Notification;
             packet.Data = new NotifyUserAuthenticated { BlazeUserId = blazeId, Subscribed = subscribed };
         });
+        return Task.CompletedTask;
     }
 }

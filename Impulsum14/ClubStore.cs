@@ -7,6 +7,8 @@ internal sealed class ClubData
     public List<ClubItem> Inventory { get; set; } = new();
     public List<CosmeticItem> Cosmetics { get; set; } = new();
     public List<ConsumableItem> Consumables { get; set; } = new();
+    public List<long> ManagerItemIds { get; set; } = new();
+    public List<long> StaffItemIds { get; set; } = new();
     public List<Manager> Managers { get; set; } = new();
     public List<StaffCard> Staff { get; set; } = new();
     public List<Squad> Squads { get; set; } = new();
@@ -54,12 +56,13 @@ internal sealed class PlayerMod
 
 internal static class ClubStore
 {
-    private static readonly object _lock = new();
-    private static readonly string _path = Path.Combine(AppContext.BaseDirectory, "Profile", "club_data.json");
-    private static readonly ClubData _data = Load();
+    private static object _lock => PlayerContext.Current.Sync;
+    private static string _path => Path.Combine(ServerOptions.Current.DataDirectory, "club_data.json");
+    private static ClubData _data => PlayerContext.Current.Data.Club;
 
-    static ClubStore()
+    internal static void Initialize()
     {
+        EnsureOwnedIds();
         MigrateItemIds();
 
         if (Environment.GetEnvironmentVariable("FUT_SEED_CLUB") == "1")
@@ -86,6 +89,7 @@ internal static class ClubStore
                 _data.Cosmetics.Clear();
                 _data.Consumables.Clear();
                 _data.Staff.Clear();
+            _data.StaffItemIds.Clear();
                 _data.Squads.Clear();
                 _data.ActiveSquadId = 0;
                 _data.AllPlayersSeeded = false;
@@ -95,7 +99,7 @@ internal static class ClubStore
                 _data.ConsumablesVersion = 0;
                 if (had) Save();
             }
-            Console.WriteLine("[Club] empty club (fresh account / cleared stale seed)");
+            ServerDiagnostics.Write("[Club] empty club (fresh account / cleared stale seed)");
             MigrateCollections();
             return;
         }
@@ -123,10 +127,13 @@ internal static class ClubStore
         lock (_lock)
         {
             // Fresh club -> clean slate, then grant the squad.
+            _data.Managers.Clear();
+            _data.ManagerItemIds.Clear();
             _data.Inventory.Clear();
             _data.Cosmetics.Clear();
             _data.Consumables.Clear();
             _data.Staff.Clear();
+            _data.StaffItemIds.Clear();
             _data.Squads.Clear();
             var club = FutProfileStore.Get().Club;
             long newBadge = club.ActiveBadgeId;
@@ -191,7 +198,8 @@ internal static class ClubStore
             if (pickedManager.ResourceId != 0)
             {
                 _data.Managers.Add(pickedManager);
-                managerItemId = Impulsum14.WebServer.ManagerItemIdBase + Array.IndexOf(Managers.All, pickedManager);
+                managerItemId = Impulsum14.WebServer.ManagerItemIdBase;
+                _data.ManagerItemIds.Add(managerItemId);
             }
 
             var squad = new Squad { Id = 0, Name = string.IsNullOrWhiteSpace(clubName) ? "Squad 1" : clubName, Formation = "f442", ManagerId = managerItemId };
@@ -200,7 +208,7 @@ internal static class ClubStore
             _data.ActiveSquadId = 0;
             Save();
             string colours = string.Join("", tiers.Select(t => t == 2 ? "G" : t == 1 ? "S" : "b"));
-            Console.WriteLine($"[Club] starter squad granted: {chosen.Count} players " +
+            ServerDiagnostics.Write($"[Club] starter squad granted: {chosen.Count} players " +
                               $"(XI|bench|reserves {colours[..XiSlots]}|{colours[XiSlots..18]}|{colours[18..]})" +
                               (silverSlot < 0 ? ", no silver" : "") +
                               (rareSlot >= 0 ? $", one rare in slot {rareSlot}" : ", no rares"));
@@ -248,7 +256,7 @@ internal static class ClubStore
                 c => c.Category == 0 || (c.Type == "ball" && c.ResourceId < ClubItems.BallIdFloor));
             if (dropped > 0)
             {
-                Console.WriteLine($"[Club] dropped {dropped} stale club items");
+                ServerDiagnostics.Write($"[Club] dropped {dropped} stale club items");
                 Save();
             }
             int promoted = 0;
@@ -260,7 +268,7 @@ internal static class ClubStore
                 }
             if (promoted > 0)
             {
-                Console.WriteLine($"[Club] promoted {promoted} unassigned items into the club");
+                ServerDiagnostics.Write($"[Club] promoted {promoted} unassigned items into the club");
                 Save();
             }
         }
@@ -277,7 +285,7 @@ internal static class ClubStore
             _data.Consumables.AddRange(catalog);
             _data.ConsumablesVersion = CurrentConsumablesVersion;
             if (catalog.Length > 0)
-                Console.WriteLine($"[Club] consumables: {catalog.Length}");
+                ServerDiagnostics.Write($"[Club] consumables: {catalog.Length}");
             Save();
         }
     }
@@ -293,7 +301,7 @@ internal static class ClubStore
             _data.Consumables.AddRange(ConsumableItems.Catalog);
             _data.ConsumablesVersion = CurrentConsumablesVersion;
             Save();
-            Console.WriteLine($"[Club] consumables re-seeded to full catalog: {had} -> {_data.Consumables.Count}");
+            ServerDiagnostics.Write($"[Club] consumables re-seeded to full catalog: {had} -> {_data.Consumables.Count}");
         }
     }
 
@@ -305,7 +313,7 @@ internal static class ClubStore
             _data.Cosmetics.Clear();
             _data.Cosmetics.AddRange(catalog);
             if (catalog.Length > 0)
-                Console.WriteLine($"[Club] club items: {catalog.Length}");
+                ServerDiagnostics.Write($"[Club] club items: {catalog.Length}");
             Save();
         }
     }
@@ -319,11 +327,12 @@ internal static class ClubStore
         {
             var catalog = Staff.All;
             _data.Staff.Clear();
+            _data.StaffItemIds.Clear();
             _data.Staff.AddRange(catalog);
             _data.StaffSeeded = true;
             _data.StaffVersion = CurrentStaffVersion;
             if (catalog.Length > 0)
-                Console.WriteLine($"[Club] staff (full debug catalog): {catalog.Length}");
+                ServerDiagnostics.Write($"[Club] staff (full debug catalog): {catalog.Length}");
             Save();
         }
     }
@@ -345,11 +354,12 @@ internal static class ClubStore
             if (_data.StaffVersion >= CurrentStaffVersion || Staff.All.Length == 0) return;
             int had = _data.Staff.Count;
             _data.Staff.Clear();
+            _data.StaffItemIds.Clear();
             _data.Staff.AddRange(Staff.All);
             _data.StaffSeeded = true;
             _data.StaffVersion = CurrentStaffVersion;
             Save();
-            Console.WriteLine($"[Club] staff re-seeded from corrected catalog: {had} -> {_data.Staff.Count}");
+            ServerDiagnostics.Write($"[Club] staff re-seeded from corrected catalog: {had} -> {_data.Staff.Count}");
         }
     }
 
@@ -368,7 +378,7 @@ internal static class ClubStore
                     squad.Slots.Remove(idx);
 
             if (before > 0 || specials.Length > 0)
-                Console.WriteLine($"[Club] special cards: removed {before}, added {specials.Length}");
+                ServerDiagnostics.Write($"[Club] special cards: removed {before}, added {specials.Length}");
             Save();
         }
     }
@@ -411,7 +421,7 @@ internal static class ClubStore
             _data.Seeded = true;
             _data.AllPlayersSeeded = true;
             Save();
-            Console.WriteLine($"[Club] seeded {_data.Inventory.Count} players; starting XI = {xi.Count}");
+            ServerDiagnostics.Write($"[Club] seeded {_data.Inventory.Count} players; starting XI = {xi.Count}");
         }
     }
 
@@ -423,7 +433,9 @@ internal static class ClubStore
             _data.Cosmetics.Clear();
             _data.Consumables.Clear();
             _data.Managers.Clear();
+            _data.ManagerItemIds.Clear();
             _data.Staff.Clear();
+            _data.StaffItemIds.Clear();
             _data.Squads.Clear();
             _data.ActiveSquadId = 0;
             _data.Seeded = false;
@@ -437,7 +449,7 @@ internal static class ClubStore
             _data.MarketBuySeq = 850_000_000;
             Save();
         }
-        Console.WriteLine("[Club] wiped (club deleted)");
+        ServerDiagnostics.Write("[Club] wiped (club deleted)");
     }
 
     public static ClubData Get()
@@ -449,6 +461,7 @@ internal static class ClubStore
     {
         lock (_lock)
         {
+            PlayerContext.MarkDirty();
             change(_data);
             Save();
         }
@@ -540,47 +553,34 @@ internal static class ClubStore
             _data.Inventory.Clear();
             _data.Inventory.AddRange(kept);
 
-            string backup = Path.Combine(AppContext.BaseDirectory, "Profile", "club_data.pre-stableid.json");
+            string backup = Path.Combine(ServerOptions.Current.DataDirectory, "club_data.pre-stableid.json");
             try
             {
                 if (File.Exists(_path) && !File.Exists(backup)) File.Copy(_path, backup);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Club] could not back up {_path}: {ex.GetType().Name}: {ex.Message}");
+                ServerDiagnostics.Write($"[Club] could not back up {_path}: {ex.GetType().Name}: {ex.Message}");
             }
 
             Save();
-            Console.WriteLine($"[Club] player item IDs migrated: {remap.Count} remapped" +
+            ServerDiagnostics.Write($"[Club] player item IDs migrated: {remap.Count} remapped" +
                               (collisionsSplit > 0 ? $", {collisionsSplit} ID collision(s) split (both players kept)" : "") +
                               (dupCopies > 0 ? $", {dupCopies} true duplicate copy/copies collapsed" : ""));
         }
     }
 
-    private static ClubData Load()
+    internal static void EnsureOwnedIds()
     {
-        try
-        {
-            if (File.Exists(_path))
-                return JsonSerializer.Deserialize<ClubData>(File.ReadAllText(_path)) ?? new ClubData();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Club] failed to load {_path}, using defaults: {ex.GetType().Name}: {ex.Message}");
-        }
-        return new ClubData();
+        while (_data.ManagerItemIds.Count < _data.Managers.Count) _data.ManagerItemIds.Add(WebServer.ManagerItemIdBase + _data.ManagerItemIds.Count);
+        while (_data.StaffItemIds.Count < _data.Staff.Count) _data.StaffItemIds.Add(WebServer.StaffItemIdBase + _data.StaffItemIds.Count);
+        foreach (var squad in _data.Squads)
+            if (squad.ManagerId > 0 && !_data.ManagerItemIds.Contains(squad.ManagerId))
+            {
+                int legacy = (int)(squad.ManagerId - WebServer.ManagerItemIdBase);
+                int owned = legacy >= 0 && legacy < Managers.All.Length ? _data.Managers.FindIndex(m => m.ResourceId == Managers.All[legacy].ResourceId) : -1;
+                squad.ManagerId = owned >= 0 ? _data.ManagerItemIds[owned] : 0;
+            }
     }
-
-    private static void Save()
-    {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            File.WriteAllText(_path, JsonSerializer.Serialize(_data, new JsonSerializerOptions { WriteIndented = false }));
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Club] failed to save {_path}: {ex.GetType().Name}: {ex.Message}");
-        }
-    }
+    private static void Save() { EnsureOwnedIds(); PlayerContext.MarkDirty(); }
 }

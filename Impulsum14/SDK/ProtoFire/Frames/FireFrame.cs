@@ -61,9 +61,9 @@ public class FireFrame : IFireFrame
         stream.Write(Frame, 0, HeaderSize);
     }
 
-    public Task WriteToAsync(Stream stream)
+    public Task WriteToAsync(Stream stream, CancellationToken cancellationToken = default)
     {
-        return stream.WriteAsync(Frame, 0, HeaderSize);
+        return stream.WriteAsync(Frame.AsMemory(0, HeaderSize), cancellationToken).AsTask();
     }
 
     public byte[] ToHeader()
@@ -92,6 +92,7 @@ public class FireFrame : IFireFrame
         }
         set
         {
+            ulong context = Context;
             Frame[0] = (byte)(value >> 8);
             Frame[1] = (byte)value;
             if (value > ushort.MaxValue || OptionEnabled(Option.JUMBO_FRAME))
@@ -100,6 +101,7 @@ public class FireFrame : IFireFrame
                 Frame[12] = (byte)(value >> 24);
                 Frame[13] = (byte)(value >> 16);
             }
+            Context = context;
         }
     }
 
@@ -165,7 +167,7 @@ public class FireFrame : IFireFrame
         }
         set
         {
-            if(MessageType == MessageType.Ping || MessageType == MessageType.PingReply)
+            if(value == MessageType.Ping || value == MessageType.PingReply)
                 throw new InvalidOperationException("FireFrame does not support ping and ping reply message types");
 
             //userIndexBits    //msgType
@@ -313,15 +315,15 @@ public class FireFrame : IFireFrame
 
     }
 
-    public async Task InitializeAsync(Stream stream)
+    public async Task InitializeAsync(Stream stream, CancellationToken cancellationToken = default)
     {
         // Reading the minimum header size bytes
-        await stream.ReadExactlyAsync(Frame, 0, MIN_HEADER_SIZE).ConfigureAwait(false);
+        await stream.ReadExactlyAsync(Frame.AsMemory(0, MIN_HEADER_SIZE), cancellationToken).ConfigureAwait(false);
 
         // Based on the minimum read header size, we can determine if we need to read more bytes (extra header)
         int extraFrameBytesNeeded = ExtraHeaderSize;
         if (extraFrameBytesNeeded > 0)
-            await stream.ReadExactlyAsync(Frame, MIN_HEADER_SIZE, extraFrameBytesNeeded).ConfigureAwait(false);
+            await stream.ReadExactlyAsync(Frame.AsMemory(MIN_HEADER_SIZE, extraFrameBytesNeeded), cancellationToken).ConfigureAwait(false);
     }
 
     public IFireFrame CreateResponseFrame() => CreateResponseFrame(0);

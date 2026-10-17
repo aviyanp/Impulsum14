@@ -39,9 +39,9 @@ public class Fire2Frame : IFireFrame
         stream.Write(Frame, 0, HEADER_SIZE);
     }
 
-    public async Task WriteToAsync(Stream stream)
+    public async Task WriteToAsync(Stream stream, CancellationToken cancellationToken = default)
     {
-        await stream.WriteAsync(Frame, 0, HEADER_SIZE).ConfigureAwait(false);
+        await stream.WriteAsync(Frame.AsMemory(0, HEADER_SIZE), cancellationToken).ConfigureAwait(false);
     }
 
     public int HeaderSize => HEADER_SIZE;
@@ -161,9 +161,9 @@ public class Fire2Frame : IFireFrame
         stream.ReadExactly(Frame, 0, HEADER_SIZE);
     }
 
-    public async Task InitializeAsync(Stream stream)
+    public async Task InitializeAsync(Stream stream, CancellationToken cancellationToken = default)
     {
-        await stream.ReadExactlyAsync(Frame, 0, HEADER_SIZE).ConfigureAwait(false);
+        await stream.ReadExactlyAsync(Frame.AsMemory(0, HEADER_SIZE), cancellationToken).ConfigureAwait(false);
     }
 
     public IFireFrame CreateResponseFrame() => CreateResponseFrame(0);

@@ -26,6 +26,9 @@ internal sealed class Squad
     public int Chemistry { get; set; }
     public int StarRating { get; set; }
     public long ManagerId { get; set; } = 0;
+    public long CaptainId { get; set; }
+    public Dictionary<int, long> KickTakers { get; set; } = new();
+    public Dictionary<int, int> KitNumbers { get; set; } = new();
     public System.Collections.Generic.Dictionary<int, long> Slots { get; set; } = new();
 }
 
@@ -55,7 +58,7 @@ internal static class RealPlayers
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[RealPlayers] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[RealPlayers] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
         }
         return list.ToArray();
     }

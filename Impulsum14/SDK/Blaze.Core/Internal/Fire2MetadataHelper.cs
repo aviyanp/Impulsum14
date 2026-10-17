@@ -1,3 +1,7 @@
+using EATDF.Members;
+using EATDF.Serialization;
+using EATDF.Types;
+
 namespace Blaze.Core.Internal;
 
 /// <summary>
@@ -44,29 +48,25 @@ internal static class Fire2MetadataHelper
     {
         context = 0;
         errorCode = 0;
-
-        int pos = 0;
-        while (pos + 4 <= data.Length)
+        var metadata = new EmptyMessage();
+        if (!new Heat2Serializer().Deserialize(new MemoryStream(data, false), metadata))
+            throw new InvalidDataException("Invalid Fire2 metadata.");
+        bool hasContext = false, hasError = false;
+        foreach (var field in metadata.GetUnknownMembers())
         {
-            // Read 4-byte Heat2 header: 3 bytes tag + 1 byte type
-            uint tag = (uint)(data[pos] << 24 | data[pos + 1] << 16 | data[pos + 2] << 8);
-            byte type = data[pos + 3];
-            pos += 4;
-
-            if (type == 0x00) // Integer
+            if (field.TdfInfo.Tag == 0x8EED3800)
             {
-                long value = ReadVarInt(data, ref pos);
-
-                if (tag == 0x8EED3800) // CNTX
-                    context = unchecked((ulong)value);
-                else if (tag == 0x972CA300) // ERRC
-                    errorCode = (int)value;
+                if (hasContext || field is not TdfInt64 contextField)
+                    throw new InvalidDataException("Invalid Fire2 context metadata.");
+                context = unchecked((ulong)contextField.Value);
+                hasContext = true;
             }
-            else
+            else if (field.TdfInfo.Tag == 0x972CA300)
             {
-                // Skip unknown fields — for robustness, break out
-                // (a full implementation would skip based on type)
-                break;
+                if (hasError || field is not TdfInt64 errorField || errorField.Value < int.MinValue || errorField.Value > uint.MaxValue)
+                    throw new InvalidDataException("Invalid Fire2 error metadata.");
+                errorCode = unchecked((int)errorField.Value);
+                hasError = true;
             }
         }
     }
@@ -97,31 +97,4 @@ internal static class Fire2MetadataHelper
         stream.WriteByte((byte)(curByte & 0x7F));
     }
 
-    private static long ReadVarInt(byte[] data, ref int pos)
-    {
-        if (pos >= data.Length)
-            return 0;
-
-        byte first = data[pos++];
-        if (first == 0)
-            return 0;
-
-        bool negative = (first & 0x40) != 0;
-        long value = first & 0x3F;
-        int shift = 6;
-
-        if ((first & 0x80) != 0)
-        {
-            while (pos < data.Length)
-            {
-                byte b = data[pos++];
-                value |= (long)(b & 0x7F) << shift;
-                shift += 7;
-                if ((b & 0x80) == 0)
-                    break;
-            }
-        }
-
-        return negative ? -value : value;
-    }
 }

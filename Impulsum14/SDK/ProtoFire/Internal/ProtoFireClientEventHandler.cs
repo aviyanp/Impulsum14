@@ -1,4 +1,4 @@
-﻿using ProtoFire.Frames;
+using ProtoFire.Frames;
 using ProtoFire.Tls;
 using System;
 using System.Collections.Generic;
@@ -12,7 +12,11 @@ internal class ProtoFireClientEventHandler(ProtoFireClient client, IProtoFireHan
 {
     public Task OnAuthenticatedAsync(ProtoFireConnection connection, bool secure) => userHandler.OnAuthenticatedAsync(connection, secure);
     public Task<bool> OnConnectedAsync(ProtoFireConnection connection) => userHandler.OnConnectedAsync(connection);
-    public Task OnDisconnectedAsync(ProtoFireConnection connection) => userHandler.OnDisconnectedAsync(connection);
+    public Task OnDisconnectedAsync(ProtoFireConnection connection)
+    {
+        client.FailPendingRequests();
+        return userHandler.OnDisconnectedAsync(connection);
+    }
     public Task OnErrorAsync(ProtoFireConnection connection, Exception exception) => userHandler.OnErrorAsync(connection, exception);
     public Task OnPacketSentAsync(ProtoFireConnection connection, ProtoFirePacket packet) => userHandler.OnPacketSentAsync(connection, packet);
     public Task OnPacketReceivedAsync(ProtoFireConnection connection, ProtoFirePacket packet)
@@ -21,8 +25,7 @@ internal class ProtoFireClientEventHandler(ProtoFireClient client, IProtoFireHan
 
         if (frame.MessageType == MessageType.Reply || frame.MessageType == MessageType.ErrorReply)
         {
-            if (client.replyTasks.TryRemove(packet.Frame.MessageNum, out TaskCompletionSource<ProtoFirePacket>? tcs))
-                tcs.SetResult(packet);
+            client.TryCompleteReply(packet);
         }
 
         return userHandler.OnPacketReceivedAsync(connection, packet);

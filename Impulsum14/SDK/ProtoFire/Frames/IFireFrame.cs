@@ -19,9 +19,9 @@ public interface IFireFrame
 
     // Reading the frame data from the stream
     void Initialize(Stream stream);
-    Task InitializeAsync(Stream stream);
+    Task InitializeAsync(Stream stream, CancellationToken cancellationToken = default);
 
     // Writing the frame to the stream
     void WriteTo(Stream stream);
-    Task WriteToAsync(Stream stream);
+    Task WriteToAsync(Stream stream, CancellationToken cancellationToken = default);
 }

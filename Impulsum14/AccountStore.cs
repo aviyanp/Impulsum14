@@ -14,9 +14,8 @@ internal sealed class AccountProfile
 
 internal static class AccountStore
 {
-    private static readonly object _lock = new();
-    private static readonly string _path = Path.Combine(AppContext.BaseDirectory, "Profile", "account.json");
-    private static readonly AccountProfile _profile = Load();
+    private static object _lock => PlayerContext.Current.Sync;
+    private static AccountProfile _profile => PlayerContext.Current.Data.Account;
 
     public static AccountProfile Get()
     {
@@ -49,30 +48,5 @@ internal static class AccountStore
         }
     }
 
-    private static AccountProfile Load()
-    {
-        try
-        {
-            if (File.Exists(_path))
-                return JsonSerializer.Deserialize<AccountProfile>(File.ReadAllText(_path)) ?? new AccountProfile();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Account] failed to load {_path}, using defaults: {ex.GetType().Name}: {ex.Message}");
-        }
-        return new AccountProfile();
-    }
-
-    private static void Save()
-    {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            File.WriteAllText(_path, JsonSerializer.Serialize(_profile));
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[Account] failed to save {_path}: {ex.GetType().Name}: {ex.Message}");
-        }
-    }
+    private static void Save() => PlayerContext.MarkDirty();
 }

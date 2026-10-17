@@ -1,0 +1,12 @@
+.git
+**/bin
+**/obj
+**/*.log
+artifacts
+impulsum14launcher
+tests
+deploy/accounts.json
+deploy/server.json
+Impulsum14/Profile/players
+Impulsum14/Profile/ranked
+Impulsum14/Profile/*.tmp

@@ -97,10 +97,10 @@ internal static class Totw
                 if (!d.TryGetValue(wk, out var l)) { l = new System.Collections.Generic.List<Slot>(); d[wk] = l; }
                 l.Add(new Slot(int.Parse(c[1]), int.Parse(c[2]), c[3], int.Parse(c[4]), int.Parse(c[5])));
             }
-            System.Console.WriteLine($"[TOTW] loaded {d.Count} weekly teams from {path}");
+            ServerDiagnostics.Write($"[TOTW] loaded {d.Count} weekly teams from {path}");
         }
-        catch (System.IO.FileNotFoundException) { System.Console.WriteLine("[TOTW] no totw_teams.tsv - using top-rated placeholder squad"); }
-        catch (System.Exception ex) { System.Console.WriteLine($"[TOTW] failed to load teams: {ex.Message}"); }
+        catch (System.IO.FileNotFoundException) { ServerDiagnostics.Write("[TOTW] no totw_teams.tsv - using top-rated placeholder squad"); }
+        catch (System.Exception ex) { ServerDiagnostics.Write($"[TOTW] failed to load teams: {ex.Message}"); }
         return d;
     }
 
@@ -122,7 +122,7 @@ internal static class Totw
             }
         }
         catch (System.IO.FileNotFoundException) { }
-        catch (System.Exception ex) { System.Console.WriteLine($"[TOTW] failed to load formations: {ex.Message}"); }
+        catch (System.Exception ex) { ServerDiagnostics.Write($"[TOTW] failed to load formations: {ex.Message}"); }
         return d;
     }
 

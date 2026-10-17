@@ -40,7 +40,10 @@ public class BlazeServer
 
         _protoFireSever = new ProtoFireServer(config.LocalEndpoint, eventHandler, frameType)
         {
-            Secure = _config.Secure
+            Secure = _config.Secure,
+            MaxConnections = _config.MaxConnections, MaxFrameBytes = _config.MaxFrameBytes, IdleTimeoutSeconds = _config.IdleTimeoutSeconds,
+            SendTimeoutSeconds = _config.SendTimeoutSeconds, InboundQueueCapacity = _config.InboundQueueCapacity,
+            OutboundQueueCapacity = _config.OutboundQueueCapacity
         };
     }
 

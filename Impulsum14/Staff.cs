@@ -12,7 +12,7 @@ internal static class Staff
     {
         if (Environment.GetEnvironmentVariable("FUT_SERVE_STAFF") == "0")
         {
-            Console.WriteLine("[Staff] not served (FUT_SERVE_STAFF=0).");
+            ServerDiagnostics.Write("[Staff] not served (FUT_SERVE_STAFF=0).");
             return System.Array.Empty<StaffCard>();
         }
 
@@ -42,9 +42,9 @@ internal static class Staff
         }
         catch (FileNotFoundException)
         {
-            Console.WriteLine($"[Staff] no {path}, running without extra staff");
+            ServerDiagnostics.Write($"[Staff] no {path}, running without extra staff");
         }
-        catch (Exception ex) { Console.WriteLine($"[Staff] failed: {ex.Message}"); }
+        catch (Exception ex) { ServerDiagnostics.Write($"[Staff] failed: {ex.Message}"); }
         return list.ToArray();
     }
 }

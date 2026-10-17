@@ -4,7 +4,7 @@ namespace Impulsum14;
 
 internal static class UserConfig
 {
-    private static readonly string _path = Path.Combine(AppContext.BaseDirectory, "Profile", "user.json");
+    private static readonly string _path = Path.Combine(ServerOptions.Current.DataDirectory, "user.json");
     private static readonly UserConfigData _data = Load();
 
     public static string Username => _data.Username;
@@ -19,14 +19,14 @@ internal static class UserConfig
                     new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                 if (data != null && !string.IsNullOrWhiteSpace(data.Username))
                 {
-                    Console.WriteLine($"[UserConfig] loaded username '{data.Username}' from {_path}");
+                    ServerDiagnostics.Write($"[UserConfig] loaded username '{data.Username}' from {_path}");
                     return data;
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[UserConfig] failed to load {_path}: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[UserConfig] failed to load {_path}: {ex.GetType().Name}: {ex.Message}");
         }
 
         var defaults = new UserConfigData();
@@ -34,11 +34,11 @@ internal static class UserConfig
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
             File.WriteAllText(_path, JsonSerializer.Serialize(defaults, new JsonSerializerOptions { WriteIndented = true }));
-            Console.WriteLine($"[UserConfig] created default {_path} (username='{defaults.Username}')");
+            ServerDiagnostics.Write($"[UserConfig] created default {_path} (username='{defaults.Username}')");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[UserConfig] could not write default {_path}: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[UserConfig] could not write default {_path}: {ex.GetType().Name}: {ex.Message}");
         }
         return defaults;
     }

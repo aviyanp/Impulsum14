@@ -64,7 +64,7 @@ internal sealed class OsdkSettingsComponent : BlazeComponent
             IsSupported = true,
             Func = (req, ctx) =>
             {
-                Console.WriteLine("[OSDKSettings] fetchSettings");
+                ServerDiagnostics.Write("[OSDKSettings] fetchSettings");
                 return Task.FromResult<Tdf>(new FetchSettingsResponse());
             },
         });
@@ -76,7 +76,7 @@ internal sealed class OsdkSettingsComponent : BlazeComponent
             IsSupported = true,
             Func = (req, ctx) =>
             {
-                Console.WriteLine("[OSDKSettings] fetchSettingsGroups");
+                ServerDiagnostics.Write("[OSDKSettings] fetchSettingsGroups");
                 return Task.FromResult<Tdf>(new FetchSettingsGroupsResponse());
             },
         });

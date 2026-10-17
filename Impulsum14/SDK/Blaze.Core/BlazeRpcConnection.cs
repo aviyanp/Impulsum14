@@ -1,4 +1,4 @@
-﻿using Blaze.Core.Internal;
+using Blaze.Core.Internal;
 using EATDF;
 using EATDF.Serialization;
 using ProtoFire;
@@ -16,7 +16,11 @@ public class BlazeRpcConnection : IBlazeConnection
 {
     private ProtoFireConnection _baseConnection { get; }
     private ITdfSerializer _serializer { get; }
-    internal QueuedLock BusyLock { get; } = new QueuedLock();
+    private readonly object _notificationSync = new();
+    private readonly Queue<ProtoFirePacket> _deferredNotifications = new();
+    private bool _requestActive;
+    private long _deferredBytes;
+    public CancellationToken CancellationToken => _baseConnection.CancellationToken;
 
     public EndPoint? RemoteEndPoint { get; }
     public EndPoint? LocalEndPoint { get; }
@@ -57,19 +61,55 @@ public class BlazeRpcConnection : IBlazeConnection
 
     public void EnqequeSend(ProtoFirePacket packet)
     {
-        // fire and forget
-        _ = enqequeSend(packet);
+        if (!Connected) return;
+        packet = EnsureMetadata(packet);
+        // The generated notification methods serialize the TDF before this point.
+        // No application object or unbounded waiting task survives the enqueue.
+        long bytes = packet.Data.LongLength + packet.Frame.HeaderSize
+            + (packet is ProtoFire2Packet fire2 ? fire2.MetadataData.LongLength : 0);
+        bool overflow = false;
+        lock (_notificationSync)
+        {
+            if (_requestActive)
+            {
+                if (_deferredNotifications.Count >= _baseConnection.OutboundQueueCapacity
+                    || bytes > _baseConnection.MaxQueuedOutboundBytes - _deferredBytes)
+                    overflow = true;
+                else
+                {
+                    _deferredNotifications.Enqueue(packet);
+                    _deferredBytes += bytes;
+                }
+            }
+            else _baseConnection.TryEnqueueSend(packet);
+        }
+        if (overflow) Disconnect();
     }
 
-    public bool Send(ProtoFirePacket packet) => _baseConnection.Send(packet);
-    public Task<bool> SendAsync(ProtoFirePacket packet) => _baseConnection.SendAsync(packet);
+    public bool Send(ProtoFirePacket packet) => _baseConnection.Send(EnsureMetadata(packet));
+    public Task<bool> SendAsync(ProtoFirePacket packet) => _baseConnection.SendAsync(EnsureMetadata(packet));
+
+    private static ProtoFirePacket EnsureMetadata(ProtoFirePacket packet) => packet.Frame is Fire2Frame frame && packet is not ProtoFire2Packet
+        ? new ProtoFire2Packet(frame, Fire2MetadataHelper.Encode(frame.Context, frame.ErrorCode), packet.Data)
+        : packet;
     public void Disconnect() => _baseConnection.Disconnect();
 
-    private async Task enqequeSend(ProtoFirePacket packet)
+    internal void BeginRequest()
     {
-        await BusyLock.EnterAsync().ConfigureAwait(false);
-        await SendAsync(packet).ConfigureAwait(false);
-        BusyLock.Exit();
+        lock (_notificationSync) _requestActive = true;
+    }
+
+    internal void EndRequest()
+    {
+        lock (_notificationSync)
+        {
+            // The caller has already awaited the reply write. Enqueue every
+            // notification before accepting the next RPC, preserving FIFO order.
+            while (_deferredNotifications.TryDequeue(out ProtoFirePacket? packet))
+                if (Connected) _baseConnection.TryEnqueueSend(packet);
+            _deferredBytes = 0;
+            _requestActive = false;
+        }
     }
 
     private ProtoFirePacket createProtoFirePacket(Action<BlazePacket> configure)

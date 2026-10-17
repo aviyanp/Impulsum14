@@ -18,15 +18,15 @@ internal static class TeamLeagues
                 if (int.TryParse(c[0], out int tid) && int.TryParse(c[1], out int lid))
                     map[tid] = lid;
             }
-            Console.WriteLine($"[TeamLeagues] loaded {map.Count} team->league rows from {path}");
+            ServerDiagnostics.Write($"[TeamLeagues] loaded {map.Count} team->league rows from {path}");
         }
         catch (FileNotFoundException)
         {
-            Console.WriteLine($"[TeamLeagues] no {path}, running without league filter");
+            ServerDiagnostics.Write($"[TeamLeagues] no {path}, running without league filter");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[TeamLeagues] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[TeamLeagues] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
         }
         return map;
     }

@@ -1,4 +1,4 @@
-﻿using EATDF.Visitors;
+using EATDF.Visitors;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -26,9 +26,13 @@ public class Heat2Serializer : TdfSerializer
 
     public override bool Deserialize(Stream stream, Tdf tdf)
     {
-        Heat2Decoder decoder = new Heat2Decoder(stream, Registry, Heat1BackCompatibility);
-        decoder.VisitTdf(tdf);
-        return decoder.StreamValid;
+        try
+        {
+            Heat2Decoder decoder = new Heat2Decoder(stream, Registry, Heat1BackCompatibility);
+            decoder.VisitTdf(tdf);
+            return decoder.StreamValid;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or OverflowException or ArgumentException or InvalidOperationException or NotSupportedException or System.Reflection.TargetInvocationException) { return false; }
     }
 
     public override void Serialize(Stream stream, Tdf tdf)

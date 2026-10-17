@@ -1,4 +1,4 @@
-﻿using EATDF.Heat;
+using EATDF.Heat;
 using EATDF.Heat2;
 using EATDF.Internal;
 using EATDF.Members;
@@ -75,7 +75,8 @@ public class Heat2Decoder : ITdfVisitor
             if (!reader.TrySkipNextElement(value))
                 break;
         }
-
+        // A top-level TDF has no terminator. Any trailing partial header is corrupt.
+        if (reader.HasData(1)) reader.OnFatalDecodeError();
     }
 
     public bool VisitBlazeObjectId(TdfObjectId value, Tdf parent, bool visitHeader)

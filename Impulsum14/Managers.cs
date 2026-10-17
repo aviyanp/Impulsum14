@@ -10,7 +10,7 @@ internal static class Managers
     {
         if (Environment.GetEnvironmentVariable("FUT_SERVE_MANAGERS") == "0")
         {
-            Console.WriteLine("[Managers] not served (FUT_SERVE_MANAGERS=0).");
+            ServerDiagnostics.Write("[Managers] not served (FUT_SERVE_MANAGERS=0).");
             return System.Array.Empty<Manager>();
         }
 
@@ -30,7 +30,7 @@ internal static class Managers
                     int.TryParse(c[4], out int lg) ? lg : 0));
             }
         }
-        catch (Exception ex) { Console.WriteLine($"[Managers] failed: {ex.Message}"); }
+        catch (Exception ex) { ServerDiagnostics.Write($"[Managers] failed: {ex.Message}"); }
         return list.ToArray();
     }
 }

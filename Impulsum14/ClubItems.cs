@@ -50,7 +50,7 @@ internal static class ClubItems
                 var (subType, baseRes) = Info(type);
                 if (subType == 0)
                 {
-                    Console.WriteLine($"[Items] {path}:{lineNo} unknown type '{type}', skipping");
+                    ServerDiagnostics.Write($"[Items] {path}:{lineNo} unknown type '{type}', skipping");
                     continue;
                 }
                 int assetId = int.Parse(c[1]);
@@ -64,11 +64,11 @@ internal static class ClubItems
         }
         catch (FileNotFoundException)
         {
-            Console.WriteLine($"[Items] no {path}, running without club items");
+            ServerDiagnostics.Write($"[Items] no {path}, running without club items");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Items] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[Items] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
         }
         return list.Concat(Probe(list.Count)).ToArray();
     }
@@ -85,12 +85,12 @@ internal static class ClubItems
             if (kv.Length != 2) continue;
             string type = kv[0].Trim();
             var (subType, baseRes) = Info(type);
-            if (subType == 0) { Console.WriteLine($"[Items] probe: unknown type '{type}'"); continue; }
+            if (subType == 0) { ServerDiagnostics.Write($"[Items] probe: unknown type '{type}'"); continue; }
 
             string[] range = kv[1].Split('-');
             if (!int.TryParse(range[0], out int from)) continue;
             int to = range.Length > 1 && int.TryParse(range[1], out int t) ? t : from;
-            Console.WriteLine($"[Items] probing {type} assetId {from}..{to}");
+            ServerDiagnostics.Write($"[Items] probing {type} assetId {from}..{to}");
             for (int a = from; a <= to; a++)
                 yield return new CosmeticItem(id++, type, a, baseRes + a, subType, $"{type} {a}", 75);
         }

@@ -23,51 +23,59 @@ internal static class Tournaments
     private static readonly int[] DefaultTeamIds =
         { 52, 234, 325, 236, 47, 46, 10, 5, 11, 21, 73, 240, 45, 243, 241 };
 
-    internal static int[] GetTeamIds(int tournamentId) =>
-        TeamPools.TryGetValue(tournamentId, out var pool) ? pool : DefaultTeamIds;
+    private static readonly Dictionary<int, int[]> NativeTeamPools = BuildNativeTeamPools();
+    private static Dictionary<int, int[]> BuildNativeTeamPools()
+    {
+        var eligible = Seasons.NativeTeamIds.ToHashSet();
+        var strength = RealPlayers.All.GroupBy(p => p.TeamId).ToDictionary(g => g.Key, g => g.OrderByDescending(p => p.Rating).Take(18).Average(p => p.Rating));
+        return TeamPools.ToDictionary(entry => entry.Key, entry =>
+        {
+            var pool = entry.Value.Where(eligible.Contains).Distinct().ToList();
+            double target = pool.Count > 0 ? pool.Average(id => strength[id]) : 75;
+            pool.AddRange(eligible.Except(pool).OrderBy(id => Math.Abs(strength[id] - target)).ThenBy(id => strength[id]).ThenBy(id => id).Take(15 - pool.Count));
+            return pool.Count == 15 ? pool.ToArray() : DefaultTeamIds.ToArray();
+        });
+    }
 
+    internal static int[] GetTeamIds(int tournamentId) =>
+        (NativeTeamPools.TryGetValue(tournamentId, out var pool) ? pool : DefaultTeamIds).ToArray();
+
+    // Coin-only server presets; historical first-clear packs are not advertised or inferred from client blobs.
     internal static readonly (int Id, string Name, int Design, int Diff, int Coins, int Unlock)[] Defs =
     {
-        ( 1, "Starter Cup",                1100, 1,  300,  0),  // Amateur,      first win 500 + Club Customisation Pack
-        ( 2, "Midlands Invitational",      1104, 2,  500,  0),  // Semi-Pro,     first win 600
-        ( 3, "Gold Challenge",             1108, 3,  700,  0),  // Professional, first win 1000
-        ( 4, "Quad-League Classic",        1112, 2,  600,  1),  // Semi-Pro,     first win 700
-        ( 5, "Managers Cup",               1116, 3,  700,  1),  // Professional, first win 700 + Silver Gift Pack
-        ( 6, "Bronze International Shield",1120, 4, 1000,  2),  // World Class,  first win 1000 + Gold Gift Pack
-        ( 7, "Trio Showcase",              1124, 2,  300,  2),  // Semi-Pro,     first win Silver Contracts Pack
-        ( 8, "Unified Cup",                1128, 3, 1000,  2),  // Professional, first win 1250
-        ( 9, "Pyramid Invitational",       1132, 4, 1000,  3),  // World Class,  first win 1000 + Mixed Contracts Pack
-        (10, "Silver Links Cup",           1136, 3,  700,  4),  // Professional, first win 1000
-        (11, "Federation Cup",             1140, 4,  200,  4),  // World Class,  first win 2000
-        (12, "Champions Trophy",           1144, 5, 2500,  4),  // Legendary,    first win 2500
-        (13, "Premier Clash",              1148, 3, 1200,  5),  // Professional, first win 1500
-        (14, "Ultimate Cup",               1152, 3, 3000, 10),  // Professional, first win 3000 + Gold Pack
+        ( 1, "Starter Cup",                1100, 1,  300,  0),
+        ( 2, "Midlands Invitational",      1104, 2,  500,  0),
+        ( 3, "Gold Challenge",             1108, 3,  700,  0),
+        ( 4, "Quad-League Classic",        1112, 2,  600,  1),
+        ( 5, "Managers Cup",               1116, 3,  700,  1),
+        ( 6, "Bronze International Shield",1120, 4, 1000,  2),
+        ( 7, "Trio Showcase",              1124, 2,  300,  2),
+        ( 8, "Unified Cup",                1128, 3, 1000,  2),
+        ( 9, "Pyramid Invitational",       1132, 4, 1000,  3),
+        (10, "Silver Links Cup",           1136, 3,  700,  3),
+        (11, "Federation Cup",             1140, 4,  200,  4),
+        (12, "Champions Trophy",           1144, 5, 2500,  4),
+        (13, "Premier Clash",              1148, 3, 1200,  5),
+        (14, "Ultimate Cup",               1152, 5, 3000, 10),
     };
 
     internal static string CatalogJson()
     {
-        var sb = new System.Text.StringBuilder("{\"tournament\":[");
-        for (int i = 0; i < Defs.Length; i++)
+        var profile = FutProfileStore.Get();
+        return System.Text.Json.JsonSerializer.Serialize(new
         {
-            var (id, _, _, diff, coins, unlock) = Defs[i];
-            int trophy = 8200000 + id;   // trophy doc lives at fut/items/pc/<trophy>.json
-            if (i > 0) sb.Append(',');
-            string lockState = unlock > TrophiesWon ? "LOCKED_TROPHIES" : "UNLOCKED";
-            sb.Append("{\"id\":").Append(id).Append(",\"tournamentId\":").Append(id)
-              .Append(",\"tournamentType\":0,\"type\":\"offline\",\"numTeams\":16,\"numRounds\":4,")
-              .Append("\"numMatches\":4,\"matchlength\":6,\"starttime\":0,\"timeUntilStart\":0,")
-              .Append("\"timeUntilEnd\":31536000,\"trophyResourceId\":").Append(trophy)
-              .Append(",\"trophyUserCount\":").Append(TrophiesWon).Append(",\"triesMax\":0,\"treeType\":0,\"lock\":\"").Append(lockState).Append("\",")
-              .Append("\"unlockreq\":").Append(unlock).Append(",\"nextReset\":0,\"visStart\":0,\"visEnd\":0,\"rounds\":[");
-            for (int r = 1; r <= 4; r++)
+            tournament = Defs.Select(d => new
             {
-                if (r > 1) sb.Append(',');
-                sb.Append("{\"id\":").Append(r).Append(",\"difficulty\":").Append(diff)
-                  .Append(",\"rewardMultiplier\":1,\"coins\":").Append(r == 4 ? coins : 0).Append('}');
-            }
-            sb.Append("],\"awardSet\":{\"awards\":[{\"awardType\":1,\"value\":").Append(coins).Append(",\"halid\":0}]}}");
-        }
-        return sb.Append("]}").ToString();
+                id = d.Id, type = "offline", treeType = "knockout", aigroup = d.Id,
+                eligibilityOperation = "AND", elgReq = Array.Empty<object>(), numTeams = 16, numRounds = NumRounds, matchlength = 6,
+                rounds = Enumerable.Range(1, NumRounds).Select(round => new { id = round, difficulty = d.Diff, rewardMultiplier = 1, coins = ServerOptions.Current.MatchWinCoins }),
+                awardSet = new { awards = new[] { new { awardType = 1, value = d.Coins, halid = 0 } } },
+                trophyResourceId = 8200000 + d.Id, trophyUserCount = (profile.TournamentWins ?? new()).GetValueOrDefault(d.Id),
+                @lock = d.Unlock > profile.TrophiesWon ? "LOCKED_TROPHIES" : "UNLOCKED", unlockreq = d.Unlock,
+                triesMax = 0, triesPeriod = 0, triesRemaining = 0, nextReset = 0, starttime = 0, endtime = int.MaxValue,
+                timeUntilStart = 0, timeUntilEnd = 315360000, visStart = 3650, visEnd = 3650
+            })
+        });
     }
 
     internal static string TrophyJson(int tourneyId)
@@ -80,12 +88,20 @@ internal static class Tournaments
                name + "\"}]}";
     }
 
-    internal static int ActiveTournamentId = 1;
+    internal static int ActiveTournamentId
+    {
+        get => PlayerContext.Current.Data.ActiveTournamentId;
+        set
+        {
+            if (!Defs.Any(d => d.Id == value)) throw new InvalidDataException("Unknown tournament.");
+            PlayerContext.Current.Data.ActiveTournamentId = value; PlayerContext.MarkDirty();
+        }
+    }
 
     internal static int TrophiesWon => FutProfileStore.Get().TrophiesWon;
 
     internal const int NumRounds = 4;                       // every fixed cup is a 16-team, 4-round bracket
-    internal static int? CurrentMatchTournamentId = null;   // set on POST /match for a tournament match
+
 
     internal static int AwardCoins(int tournamentId)
     {
@@ -93,14 +109,13 @@ internal static class Tournaments
         return 0;
     }
 
-    internal static string TeamsJson(int tournamentId = 0)
+    internal static string TeamsJson(int tournamentId = 0, int count = 15)
     {
-        int tid = tournamentId > 0 ? tournamentId : ActiveTournamentId;
-        int[] ids = GetTeamIds(tid);
-        string arr = "[" + string.Join(",", ids) + "]";
-        return "{\"team\":" + arr + ",\"teams\":" + arr + ",\"teamIds\":" + arr + ",\"teamId\":" + arr +
-               ",\"entries\":" + arr + ",\"list\":" + arr + ",\"data\":" + arr + ",\"results\":" + arr +
-               ",\"totalResults\":" + ids.Length + "}";
+        int id = tournamentId > 0 ? tournamentId : ActiveTournamentId;
+        if (!Defs.Any(d => d.Id == id) || count is < 0 or > 15) throw new InvalidDataException("Invalid tournament opponent request.");
+        // The player's FUT club occupies the sixteenth bracket slot. This exact
+        // member is consumed by FutGetTournamentTeams; alternate guessed arrays are unnecessary.
+        return System.Text.Json.JsonSerializer.Serialize(new { teamId = GetTeamIds(id).Take(count).ToArray() });
     }
 
     internal static string EscapeJson(string s)
@@ -162,82 +177,156 @@ internal static class Tournaments
 
     internal static string CaptureString(string body, string field)
     {
-        var m = System.Text.RegularExpressions.Regex.Match(body ?? "",
-            "\"" + field + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
-        return m.Success ? UnescapeJson(m.Groups[1].Value) : "";
+        using var document = System.Text.Json.JsonDocument.Parse(body ?? "{}");
+        if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) throw new InvalidDataException("Invalid tournament save.");
+        return CompetitionSave.ReadString(document.RootElement, field);
     }
+
+    private static bool CanResume(int id, SavedTournament saved) => Defs.Any(d => d.Id == id && d.Unlock <= TrophiesWon)
+        && saved is not null && saved.Active && ServerOptions.Current.ResumeCompetitionBlobs && saved.RunId > 0 && saved.SavedRunId == saved.RunId
+        && saved.CompletedRounds is >= 0 and < NumRounds && saved.Round == saved.CompletedRounds + 1
+        && saved.DataVersion > 0 && saved.ProgressDataVersion > 0
+        && CompetitionSave.Resumable(saved.TournamentData, saved.ProgressData, saved.Round);
 
     internal static string UserTournamentJson(int id)
     {
-        var s = FutProfileStore.Get().SavedTournaments.GetValueOrDefault(id);
-        if (s is null)
-            return "{\"tournamentId\":" + id + "}";
-        return "{\"tournamentId\":" + id + ",\"round\":" + s.Round +
-               ",\"dataVersion\":" + s.DataVersion +
-               ",\"tournamentData\":\"" + EscapeJson(s.TournamentData) + "\"" +
-               ",\"progressDataVersion\":" + s.ProgressDataVersion +
-               ",\"progressData\":\"" + EscapeJson(s.ProgressData) + "\"}";
+        var saved = FutProfileStore.Get().SavedTournaments.GetValueOrDefault(id);
+        return CanResume(id, saved) ? WireSave(id, saved) : MinimalSave(id);
     }
 
-    internal static string UserListJson()
+    internal static string UserListJson() => System.Text.Json.JsonSerializer.Serialize(new
     {
-        var ids = FutProfileStore.Get().SavedTournaments.Keys.OrderBy(k => k);
-        return "{\"tournamentId\":[" + string.Join(",", ids) + "]}";
-    }
+        tournamentId = FutProfileStore.Get().SavedTournaments.Where(p => CanResume(p.Key, p.Value)).Select(p => p.Key).OrderBy(id => id).ToArray()
+    });
 
-    internal static string SaveProgress(int id, int round, int dataVersion, string? tournamentData,
-                                        int progressDataVersion, string? progressData)
+    private static string MinimalSave(int id) => System.Text.Json.JsonSerializer.Serialize(new { tournamentId = id });
+
+    private static string WireSave(int id, SavedTournament saved)
     {
-        tournamentData ??= "";
-        progressData ??= "";
-        FutProfileStore.Mutate(p =>
+        var document = new Dictionary<string, object>
         {
-            var s = p.SavedTournaments.TryGetValue(id, out var e) ? e : new SavedTournament();
-            s.Round = round;
-            s.DataVersion = dataVersion;
-            s.TournamentData = tournamentData;
-            s.ProgressDataVersion = progressDataVersion;
-            s.ProgressData = progressData;
-            s.Active = true;
-            p.SavedTournaments[id] = s;
-        });
-        return "{\"tournamentId\":" + id + ",\"round\":" + round + ",\"dataVersion\":" + dataVersion +
-               ",\"tournamentData\":\"" + EscapeJson(tournamentData) + "\",\"progressDataVersion\":" +
-               progressDataVersion + ",\"progressData\":\"" + EscapeJson(progressData) + "\"}";
+            ["tournamentId"] = id, ["round"] = saved.Round,
+            ["tournamentData"] = saved.TournamentData, ["dataVersion"] = saved.DataVersion
+        };
+        if (!string.IsNullOrEmpty(saved.ProgressData))
+        {
+            document["progressdata"] = saved.ProgressData; document["progressDataVersion"] = saved.ProgressDataVersion;
+        }
+        return System.Text.Json.JsonSerializer.Serialize(document);
     }
 
-    internal static (int Prize, bool WonFinal) SettleTournamentMatch(int id, string? endReason)
+    private static void EnsureAvailable(int id, FutProfile profile)
     {
-        string r = (endReason ?? "").ToUpperInvariant();
+        if (!Defs.Any(d => d.Id == id && d.Unlock <= profile.TrophiesWon)) throw new InvalidDataException("Unknown or locked tournament.");
+    }
+
+    private static SavedTournament GetRun(FutProfile profile, int id)
+    {
+        profile.SavedTournaments ??= new();
+        if (!profile.SavedTournaments.TryGetValue(id, out var saved)) profile.SavedTournaments[id] = saved = new();
+        if (saved.RunId < 1 || saved.CompletedRounds is < 0 or >= NumRounds || saved.Round != saved.CompletedRounds + 1)
+            throw new InvalidDataException("Tournament record is inconsistent.");
+        return saved;
+    }
+
+    internal static (long RunId, int Round) BeginMatch(int id)
+    {
+        (long RunId, int Round) result = default;
+        FutProfileStore.Mutate(profile =>
+        {
+            EnsureAvailable(id, profile);
+            var saved = GetRun(profile, id);
+            saved.Active = true; saved.Won = false;
+            result = (saved.RunId, saved.CompletedRounds + 1);
+        });
+        return result;
+    }
+
+    internal static string SaveProgress(int id, string body)
+    {
+        using var document = System.Text.Json.JsonDocument.Parse(body);
+        var root = document.RootElement;
+        if (root.ValueKind != System.Text.Json.JsonValueKind.Object) throw new InvalidDataException("Invalid tournament save.");
+        if (root.TryGetProperty("tournamentId", out _) && CompetitionSave.ReadInt(root, "tournamentId", -1) != id)
+            throw new InvalidDataException("Tournament identity does not match the save target.");
+        string progress = CompetitionSave.ReadString(root, "progressData");
+        if (progress.Length == 0) progress = CompetitionSave.ReadString(root, "progressdata");
+        return SaveProgress(id, CompetitionSave.ReadInt(root, "round", 1), CompetitionSave.ReadInt(root, "dataVersion", 1),
+            CompetitionSave.ReadString(root, "tournamentData"), CompetitionSave.ReadInt(root, "progressDataVersion", 1), progress);
+    }
+
+    internal static string SaveProgress(int id, int round, int dataVersion, string tournamentData, int progressDataVersion, string progressData)
+    {
+        if (round is < 1 or > NumRounds || dataVersion < 1 || progressDataVersion < 1
+            || (tournamentData?.Length ?? 0) > CompetitionSave.MaxBlobLength || (progressData?.Length ?? 0) > CompetitionSave.MaxBlobLength)
+            throw new InvalidDataException("Invalid tournament save.");
+        tournamentData ??= ""; progressData ??= "";
+        FutProfileStore.Mutate(profile =>
+        {
+            EnsureAvailable(id, profile);
+            var saved = GetRun(profile, id);
+            // Native blobs cannot skip, rewind or complete authoritative rounds.
+            if (round != saved.CompletedRounds + 1) return;
+            string fingerprint = CompetitionSave.Fingerprint(round, tournamentData, progressData);
+            if ((saved.RetiredSaveHashes ??= new()).Contains(fingerprint, StringComparer.Ordinal)) return;
+            if (saved.TournamentData != tournamentData || saved.ProgressData != progressData || saved.Round != round) RetireSave(saved);
+            saved.Round = round; saved.DataVersion = dataVersion; saved.TournamentData = tournamentData;
+            saved.ProgressDataVersion = progressDataVersion; saved.ProgressData = progressData;
+            saved.SavedRunId = saved.RunId; saved.Active = true; saved.Won = false;
+        });
+        // Never reflect a rejected, malformed or kickoff-stub save as resumable.
+        return UserTournamentJson(id);
+    }
+
+    private static void RetireSave(SavedTournament saved)
+    {
+        if (!string.IsNullOrEmpty(saved.TournamentData) || !string.IsNullOrEmpty(saved.ProgressData))
+            CompetitionSave.Retire(saved.RetiredSaveHashes ??= new(), CompetitionSave.Fingerprint(saved.Round, saved.TournamentData, saved.ProgressData));
+        saved.TournamentData = ""; saved.ProgressData = ""; saved.SavedRunId = 0;
+    }
+
+    private static void EndRun(SavedTournament saved, bool won)
+    {
+        RetireSave(saved);
+        saved.RunId = checked(saved.RunId + 1); saved.CompletedRounds = 0; saved.Round = 1;
+        saved.Active = false; saved.Won = won;
+    }
+
+    internal static void Reset(int id)
+    {
+        FutProfileStore.Mutate(profile =>
+        {
+            EnsureAvailable(id, profile);
+            EndRun(GetRun(profile, id), false);
+        });
+    }
+
+    internal static (int Prize, bool WonFinal) SettleTournamentMatch(int id, string? endReason, long expectedRunId = 0, int expectedRound = 0)
+    {
+        string reason = (endReason ?? "").ToUpperInvariant();
+        // A knockout draw is unresolved until extra time/penalties identifies a winner.
+        if (reason is not ("WIN" or "LOSS" or "DNF" or "QUIT")) throw new InvalidDataException("Knockout matches require a winner or an abandonment.");
         int prize = 0;
         bool wonFinal = false;
-        FutProfileStore.Mutate(p =>
+        FutProfileStore.Mutate(profile =>
         {
-            var s = p.SavedTournaments.TryGetValue(id, out var e) ? e : new SavedTournament();
-            int cur = Math.Clamp(s.Round, 1, NumRounds);
-            if (r == "WIN")
+            EnsureAvailable(id, profile);
+            var saved = GetRun(profile, id);
+            int round = saved.CompletedRounds + 1;
+            if (expectedRunId != 0 && saved.RunId != expectedRunId || expectedRound != 0 && round != expectedRound)
+                throw new InvalidDataException("Match belongs to an earlier tournament round.");
+            if (reason != "WIN") { EndRun(saved, false); return; }
+            if (round < NumRounds)
             {
-                if (cur < NumRounds)
-                {
-                    // Do NOT advance s.Round here. The client is the sole bracket authority —
-                    // it will PUT the updated round + new blobs on re-entry. If we bumped round
-                    // here the GET on re-entry would return round=N+1 but tournamentData/progressData
-                    // would still be the old round-N blobs, causing a round-vs-blob mismatch that
-                    // crashes the game client.
-                    s.Active = true;
-                    p.SavedTournaments[id] = s;
-                }
-                else
-                {
-                    prize = AwardCoins(id);            // final-round win: award the cup prize once
-                    wonFinal = true;
-                    p.SavedTournaments.Remove(id);     // run complete -> replayable, no longer underway
-                }
+                RetireSave(saved);
+                saved.CompletedRounds = round; saved.Round = round + 1; saved.Active = true; saved.Won = false;
+                return;
             }
-            else if (r is "LOSS" or "DNF" or "QUIT")
-            {
-                p.SavedTournaments.Remove(id);         // run over -> cup can be entered again
-            }
+            prize = AwardCoins(id); wonFinal = true;
+            (profile.TournamentWins ??= new())[id] = checked(profile.TournamentWins.GetValueOrDefault(id) + 1);
+            profile.TrophiesWon = checked(profile.TrophiesWon + 1);
+            // Retain a bounded tombstone: delayed old saves cannot reopen the won bracket.
+            EndRun(saved, true);
         });
         return (prize, wonFinal);
     }

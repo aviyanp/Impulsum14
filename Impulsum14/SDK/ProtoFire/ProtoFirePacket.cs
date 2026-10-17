@@ -18,12 +18,15 @@ public class ProtoFirePacket
         return new MemoryStream(Data);
     }
 
-    public static ProtoFirePacket? ReadFrom<TFrame>(Stream stream) where TFrame : IFireFrame, new()
+    public static ProtoFirePacket? ReadFrom<TFrame>(Stream stream, int maxFrameBytes = 1048576) where TFrame : IFireFrame, new()
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFrameBytes);
         try
         {
             TFrame frame = new TFrame();
             frame.Initialize(stream);
+
+            if (frame.Size > maxFrameBytes) throw new InvalidDataException("Frame exceeds limit.");
 
             // Reading the data
             byte[] data = new byte[frame.Size];
@@ -33,13 +36,13 @@ public class ProtoFirePacket
 
             return new ProtoFirePacket(frame, data);
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentException or OverflowException)
         {
             return null;
         }
     }
 
-    public void WriteTo(Stream stream)
+    public virtual void WriteTo(Stream stream)
     {
         Frame.Size = (uint)Data.Length;
         Frame.WriteTo(stream);
@@ -47,32 +50,35 @@ public class ProtoFirePacket
             stream.Write(Data, 0, Data.Length);
     }
 
-    public static async Task<ProtoFirePacket?> ReadFromAsync<TFrame>(Stream stream) where TFrame : IFireFrame, new()
+    public static async Task<ProtoFirePacket?> ReadFromAsync<TFrame>(Stream stream, int maxFrameBytes = 1048576, CancellationToken cancellationToken = default) where TFrame : IFireFrame, new()
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFrameBytes);
         try
         {
             TFrame frame = new TFrame();
-            await frame.InitializeAsync(stream).ConfigureAwait(false);
+            await frame.InitializeAsync(stream, cancellationToken).ConfigureAwait(false);
+
+            if (frame.Size > maxFrameBytes) throw new InvalidDataException("Frame exceeds limit.");
 
             // Reading the data
             byte[] data = new byte[frame.Size];
 
             if (frame.Size != 0)
-                await stream.ReadExactlyAsync(data, 0, (int)frame.Size).ConfigureAwait(false);
+                await stream.ReadExactlyAsync(data.AsMemory(), cancellationToken).ConfigureAwait(false);
 
             return new ProtoFirePacket(frame, data);
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is IOException or InvalidDataException or ArgumentException or OverflowException)
         {
             return null;
         }
     }
 
-    public async Task WriteToAsync(Stream stream)
+    public virtual async Task WriteToAsync(Stream stream, CancellationToken cancellationToken = default)
     {
         Frame.Size = (uint)Data.Length;
-        await Frame.WriteToAsync(stream).ConfigureAwait(false);
+        await Frame.WriteToAsync(stream, cancellationToken).ConfigureAwait(false);
         if (Data.Length != 0)
-            await stream.WriteAsync(Data, 0, Data.Length).ConfigureAwait(false);
+            await stream.WriteAsync(Data.AsMemory(), cancellationToken).ConfigureAwait(false);
     }
 }

@@ -1,0 +1,4 @@
+# HTTP service only. Blaze/redirector TCP must be reachable separately over the private network.
+fut.example.com {
+    reverse_proxy 127.0.0.1:9988
+}

@@ -26,8 +26,8 @@ internal sealed class RedirectorComponent : RedirectorComponentBase.Server
             {
                 IpAddress = new IpAddress
                 {
-                    Hostname = "127.0.0.1",
-                    Ip = LoopbackIp,
+                    Hostname = ServerOptions.Current.AdvertisedAddress,
+                    Ip = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(System.Net.IPAddress.Parse(ServerOptions.Current.AdvertisedAddress).GetAddressBytes()),
                     Port = (ushort)_blazePort,
                 },
             },

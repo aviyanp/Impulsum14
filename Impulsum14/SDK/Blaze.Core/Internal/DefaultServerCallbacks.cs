@@ -1,4 +1,4 @@
-﻿using EATDF;
+using EATDF;
 using ProtoFire;
 using ProtoFire.Tls;
 using System;
@@ -38,7 +38,8 @@ internal class DefaultServerCallbacks : IBlazeServerCallbacks
 
     public Task OnUnhandledAsync(BlazeRpcConnection connection, ProtoFirePacket packet, bool corrupted)
     {
-        return Task.CompletedTask;
+        if (packet.Frame.MessageType != ProtoFire.Frames.MessageType.Message) return Task.CompletedTask;
+        return connection.SendAsync(new ProtoFirePacket(packet.Frame.CreateResponseFrame(corrupted ? (ushort)0x4001 : (ushort)0x4003), Array.Empty<byte>()));
     }
 
     public ProtoSSLCertificate? SelectCertificate(BlazeRpcConnection connection)

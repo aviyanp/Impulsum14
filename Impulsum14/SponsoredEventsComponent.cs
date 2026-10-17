@@ -42,7 +42,7 @@ internal sealed class SponsoredEventsComponent : BlazeComponent
             IsSupported = true,
             Func = (req, ctx) =>
             {
-                Console.WriteLine("[SponsoredEvents] getEventsURL -> fifa/sponsoredevents/events_list.xml");
+                ServerDiagnostics.Write("[SponsoredEvents] getEventsURL -> fifa/sponsoredevents/events_list.xml");
                 return Task.FromResult<Tdf>(new URLResponse
                 {
                     URL = "fifa/sponsoredevents/events_list.xml"

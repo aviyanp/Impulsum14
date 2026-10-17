@@ -10,13 +10,13 @@ internal static class Market
     internal static long Total { get; }
     private static readonly int HalfBits;       
 
-    private const int TargetTotal = 2_300_000;    
+    private static int TargetTotal => ServerOptions.Current.MarketPlayers;
     internal const long TradeIdBase = 2_000_000_000L; 
     private const long ItemIdBase = 3_000_000_000L;  
 
     internal const long ConsumableTradeIdBase = 2_010_000_000L; 
     private const long ConsumableItemIdBaseMkt = 3_010_000_000L;  
-    private const int TargetCTotal = 500_000;            
+    private static int TargetCTotal => ServerOptions.Current.MarketConsumables;
     private static readonly ConsumableItem[] CCards = Array.Empty<ConsumableItem>();
     private static readonly int[] CTier = Array.Empty<int>();   
     private static readonly long[] CBaseP = Array.Empty<long>(); 
@@ -27,7 +27,7 @@ internal static class Market
 
     internal const long ClubItemTradeIdBase = 2_020_000_000L;   
     private const long ClubItemItemIdBaseMkt = 3_020_000_000L;    
-    private const int TargetETotal = 1_000_000;                
+    private static int TargetETotal => ServerOptions.Current.MarketClubItems;
     private static readonly CosmeticItem[] ECards = Array.Empty<CosmeticItem>();
     private static readonly long[] EBaseP = Array.Empty<long>();
     private static readonly int[] ECounts = Array.Empty<int>();
@@ -37,7 +37,7 @@ internal static class Market
 
     internal const long StaffTradeIdBase = 2_030_000_000L;     
     private const long StaffItemIdBaseMkt = 3_030_000_000L;   
-    private const int TargetSTotal = 600_000;                  
+    private static int TargetSTotal => ServerOptions.Current.MarketStaff;
     private static readonly bool[] FIsManager = Array.Empty<bool>();
     private static readonly Manager[] FManager = Array.Empty<Manager>();
     private static readonly StaffCard[] FStaff = Array.Empty<StaffCard>();
@@ -362,23 +362,21 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
 
     internal static long LiveTotal(long now)
     {
-        if (_liveTotalCachedAt > 0 && now - _liveTotalCachedAt < 20) return _liveTotalCachedValue;
-        long t = 0;
-        for (long g = 0; g < Total; g++)
-            if (LiveAt(g, now)) t++;
+        // UI estimate: a bounded, evenly spaced sample avoids a full-market scan.
+        // The catalogue is virtual and private purchases are a tiny fraction of its slots.
+        if (_liveTotalCachedAt > 0 && now - _liveTotalCachedAt < 10) return _liveTotalCachedValue;
+        int samples = (int)Math.Min(4096, Total);
+        if (samples == 0) return 0;
+        long active = 0;
+        for (int i = 0; i < samples; i++)
+        {
+            long g = (long)i * Total / samples;
+            var cycle = Cycle(g, now);
+            if (cycle.local < cycle.dur) active++;
+        }
+        _liveTotalCachedValue = active * Total / samples;
         _liveTotalCachedAt = now;
-        _liveTotalCachedValue = t;
-        return t;
-    }
-
-    internal static void RefreshLiveTotal(long now)
-    {
-        if (_liveTotalCachedAt > 0 && now - _liveTotalCachedAt < 10) return;
-        long t = 0;
-        for (long g = 0; g < Total; g++)
-            if (LiveAt(g, now)) t++;
-        _liveTotalCachedAt = now;
-        _liveTotalCachedValue = t;
+        return _liveTotalCachedValue;
     }
 
     private static long _liveTotalCachedAt;
@@ -535,6 +533,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         string pos = "", int playStyle = 0, int minBuyNow = 0, int maxBuyNow = 0,
         int minCurrent = 0, int maxCurrent = 0, string sig = null, string wireType = "")
     {
+
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
         var rnd = new Random();
@@ -546,7 +545,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
 
         bool filtered = playStyle > 0 || minBuyNow > 0 || maxBuyNow > 0
                         || minCurrent > 0 || maxCurrent > 0 || wantPos.Length > 0;
-        long block = (long)num * (filtered ? 96 : 16);
+        long block = Math.Min(ServerOptions.Current.MarketScanLimit, (long)num * (filtered ? 96 : 16));
         long winStart = (scanFrom / Math.Max(1L, (long)num)) * block;
 
         bool TierOk(int i) => wantTier < 0 || CTier[i] == wantTier;
@@ -561,24 +560,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         var mc = new List<int>();
         for (int i = 0; i < CCards.Length; i++)
             if (ConsumableCatMatches(CCards[i].ItemType, cat, wireType) && TierOk(i) && StyleOk(i) && PosOk(i)) mc.Add(i);
-        if (sig != null)
-        {
-            long[] gs = DomainMatches(now, sig, key, "C", mc, CPrefix, CCounts,
-                (cg, n2) => { var cyc = CCycle(cg, n2); var (s, b) = CPrice(cg, cyc.k); return new SlotCtx(cyc.k, cyc.start, cyc.dur, cyc.gap, cyc.local, s, b); },
-                (cg, n2, ctx) => (ctx.Local < ctx.Dur && !CBoughtIn(cg, ctx.K)) || CSimBinnedAt(cg, ctx),
-                (cg, n2, ctx) => CByPriceAt(cg, ctx, minBuyNow, maxBuyNow, minCurrent, maxCurrent));
-            int from = start < gs.Length ? start : gs.Length;
-            for (int w = from; written < num && w < gs.Length; w++)
-            {
-                long cg = gs[w];
-                if (!LiveConsumableAt(cg, now) || CSimBinnedThisCycle(cg, now)) continue;   // sold / owned / not yet relisted
-                if (!CByPrice(cg, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                if (written > 0) sb.Append(',');
-                sb.Append(CEntry(cg, now, rnd));
-                written++;
-            }
-        }
-        else if (mc.Count > 0)
+        if (mc.Count > 0)
         {
             var vPrefix = new long[mc.Count + 1];
             long acc = 0;
@@ -675,7 +657,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         return true;
     }
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> CBoughtAt = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<long, long> CBoughtAt => PlayerContext.Current.Data.Market.CBoughtAt;
 
     internal static void CMarkBought(long tradeId, long now)
     {
@@ -798,6 +780,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         int leag = 0, int team = 0, int minBuyNow = 0, int maxBuyNow = 0,
         int minCurrent = 0, int maxCurrent = 0, string sig = null)
     {
+
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
         var rnd = new Random();
@@ -832,24 +815,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         var mc = new List<int>();
         for (int i = 0; i < ECards.Length; i++)
             if (ClubItemCatMatches(ECards[i].Type, cat) && TierOk(i) && TeamOk(i) && LeagueOk(i)) mc.Add(i);
-        if (sig != null)
-        {
-            long[] gs = DomainMatches(now, sig, key, "E", mc, EPrefix, ECounts,
-                (eg, n2) => { var cyc = ECycle(eg, n2); var (s, b) = EPrice(eg, cyc.k); return new SlotCtx(cyc.k, cyc.start, cyc.dur, cyc.gap, cyc.local, s, b); },
-                (eg, n2, ctx) => (ctx.Local < ctx.Dur && !EBoughtIn(eg, ctx.K)) || ESimBinnedAt(eg, ctx),
-                (eg, n2, ctx) => EByPriceAt(eg, ctx, minBuyNow, maxBuyNow, minCurrent, maxCurrent));
-            int from = start < gs.Length ? start : gs.Length;
-            for (int w = from; written < num && w < gs.Length; w++)
-            {
-                long eg = gs[w];
-                if (!LiveClubItemAt(eg, now) || ESimBinnedThisCycle(eg, now)) continue;   // sold / owned / not yet relisted
-                if (!EByPrice(eg, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                if (written > 0) sb.Append(',');
-                sb.Append(EEntry(eg, now, rnd));
-                written++;
-            }
-        }
-        else if (mc.Count > 0)
+        if (mc.Count > 0)
         {
             var vPrefix = new long[mc.Count + 1];
             long acc = 0;
@@ -946,7 +912,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         return true;
     }
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> EBoughtAt = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<long, long> EBoughtAt => PlayerContext.Current.Data.Market.EBoughtAt;
 
     internal static void EMarkBought(long tradeId, long now)
     {
@@ -1078,6 +1044,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         int nat = 0, int leag = 0, int minBuyNow = 0, int maxBuyNow = 0,
         int minCurrent = 0, int maxCurrent = 0, string sig = null)
     {
+
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
         var rnd = new Random();
@@ -1101,24 +1068,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         var mc = new List<int>();
         for (int i = 0; i < FIsManager.Length; i++)
             if (StaffCatMatches(FIsManager[i], FStaff[i], cat) && TierOk(i) && NationOk(i) && LeagueOk(i)) mc.Add(i);
-        if (sig != null)
-        {
-            long[] gs = DomainMatches(now, sig, key, "F", mc, FPrefix, FCounts,
-                (fg, n2) => { var cyc = FCycle(fg, n2); var (s, b) = FPrice(fg, cyc.k); return new SlotCtx(cyc.k, cyc.start, cyc.dur, cyc.gap, cyc.local, s, b); },
-                (fg, n2, ctx) => (ctx.Local < ctx.Dur && !FBoughtIn(fg, ctx.K)) || FSimBinnedAt(fg, ctx),
-                (fg, n2, ctx) => FByPriceAt(fg, ctx, minBuyNow, maxBuyNow, minCurrent, maxCurrent));
-            int from = start < gs.Length ? start : gs.Length;
-            for (int w = from; written < num && w < gs.Length; w++)
-            {
-                long fs = gs[w];
-                if (!LiveStaffAt(fs, now) || FSimBinnedThisCycle(fs, now)) continue;
-                if (!FByPrice(fs, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                if (written > 0) sb.Append(',');
-                sb.Append(FEntry(fs, now, rnd));
-                written++;
-            }
-        }
-        else if (mc.Count > 0)
+        if (mc.Count > 0)
         {
             var vPrefix = new long[mc.Count + 1];
             long acc = 0;
@@ -1229,7 +1179,7 @@ long n = Math.Min(finalN, (elapsed - firstDelay) / bidGap + 1);
         return true;
     }
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> FBoughtAt = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<long, long> FBoughtAt => PlayerContext.Current.Data.Market.FBoughtAt;
 
     internal static void FMarkBought(long tradeId, long now)
     {
@@ -1439,6 +1389,7 @@ string seller = SellerFor(g, cyc.k);
 
     internal static string FeedJson()
     {
+        TryAdvanceFeed(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         lock (_feedLock)
         {
             var sb = new StringBuilder("{\"total\":").Append(LiveTotal(DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
@@ -1452,6 +1403,9 @@ string seller = SellerFor(g, cyc.k);
             return sb.ToString();
         }
     }
+
+    internal readonly record struct BidTiming(long Cycle, long Duration, long EndsAt);
+    internal static BidTiming Timing(long tradeId, long now) { var c = Cycle(tradeId - TradeIdBase, now); return new(c.k, c.dur, c.start + c.dur); }
 
     internal readonly record struct BidOutcome(
         long TradeId, RealPlayer Card, int StartingBid, int BuyNow, long MyBid, bool Won);
@@ -1467,16 +1421,23 @@ string seller = SellerFor(g, cyc.k);
             long g = kv.Key - TradeIdBase;
             if (g < 0 || g >= Total) continue;
             var cyc = Cycle(g, now);
-            if (cyc.local < cyc.dur) continue;   // still live
+            var timing = PlayerContext.Current.Data.Market.BidTimings.GetValueOrDefault(kv.Key, new BidTiming(cyc.k, cyc.dur, cyc.start + cyc.dur));
+            if (now < timing.EndsAt) continue;
             var card = Cards[Locate(g)];
-            var (start, buy) = Price(card, g, cyc.k);
-            var (_, _, _, finalBid) = SimBids(card, g, cyc.k, cyc.dur, start, buy, cyc.dur);
+            var (start, buy) = Price(card, g, timing.Cycle);
+            var (_, _, _, finalBid) = SimBids(card, g, timing.Cycle, timing.Duration, start, buy, timing.Duration);
             outs.Add(new BidOutcome(kv.Key, card, start, buy, kv.Value, kv.Value >= finalBid));
         }
         return outs;
     }
 
-    internal static void RemoveMyBid(long tradeId) => MyBids.TryRemove(tradeId, out _);
+    internal static void RemoveMyBid(long tradeId)
+    {
+        MyBids.TryRemove(tradeId, out _);
+        PlayerContext.Current.Data.Market.BidTimings.TryRemove(tradeId, out _);
+        RefundedBids.TryRemove(tradeId, out _);
+        PlayerContext.MarkDirty();
+    }
 
     internal static (int Count, int Winning, int Outbid) WatchlistCounts(long now)
     {
@@ -1608,294 +1569,6 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         return true;
     }
 
-    private sealed class FilterEntry { internal long At; internal long[] Gs; }
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, FilterEntry> StyleFilterCache = new();
-    private const long StyleFilterTtlSec = 300;
-    private const long StyleFilterBytes = 32L * 1024 * 1024;
-    private static readonly object StyleFilterLock = new();
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, FilterEntry> ViewFilterCache = new();
-    private const long ViewFilterTtlSec = 300;
-    private const long ViewFilterBytes = 12L * 1024 * 1024;
-    private static readonly object ViewFilterLock = new();
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, FilterEntry> DomainFilterCache = new();
-    private const long DomainFilterBytes = 12L * 1024 * 1024;
-    private static readonly object DomainFilterLock = new();
-
-    private static long[] FilterLookupOr(
-        System.Collections.Concurrent.ConcurrentDictionary<string, FilterEntry> cache, object buildLock,
-        long ttlSec, long budgetBytes, string sig, long now, Func<long[]> build)
-    {
-        if (cache.TryGetValue(sig, out var e) && now - e.At < ttlSec) return e.Gs;
-        lock (buildLock)
-        {
-            if (cache.TryGetValue(sig, out var e2) && now - e2.At < ttlSec) return e2.Gs;
-            long[] gs = build();
-            cache[sig] = new FilterEntry { At = now, Gs = gs };
-            long bytes = 0;
-            foreach (var kv in cache) bytes += 8L * (kv.Value.Gs?.LongLength ?? 0);
-            if (bytes > budgetBytes)
-                foreach (var kv in cache.OrderBy(k => k.Value.At).ToList())
-                {
-                    if (bytes <= budgetBytes) break;
-                    bytes -= 8L * (kv.Value.Gs?.LongLength ?? 0);
-                    cache.TryRemove(kv.Key, out _);
-                }
-            return gs;
-        }
-    }
-
-    private static long[] StyleFilterMatches(long now, string sig, uint key,
-        int minBuyNow, int maxBuyNow, int minCurrent, int maxCurrent, int playStyle, string[] wantPos)
-    {
-        return FilterLookupOr(StyleFilterCache, StyleFilterLock, StyleFilterTtlSec, StyleFilterBytes, sig, now, () =>
-        {
-            int workers = Math.Max(1, Environment.ProcessorCount);
-            var parts = new List<long>[workers];
-            System.Threading.Tasks.Parallel.For(0, workers, w =>
-            {
-                long lo = (long)w * Total / workers;
-                long hi = (long)(w + 1) * Total / workers;
-                var hits = new List<long>(8192 / workers);
-                for (long p = lo; p < hi; p++)
-                {
-                    long g = Permute(p, key);
-                    var cyc = Cycle(g, now);
-                    if (cyc.local >= cyc.dur || BoughtIn(g, cyc.k)) continue;
-                    int i = Locate(g);
-                    RealPlayer c = Cards[i];
-                    if (!StyleOkForK(c, g, cyc.k, playStyle)) continue;
-                    if (!PosOk(c, g, cyc.k, wantPos)) continue;
-                    var (start, buy) = Price(c, g, cyc.k);
-                    long eff = EffStart(c, g, cyc.k, cyc.dur, start, buy);
-                    var (_, sim, _, _) = SimBids(c, g, cyc.k, cyc.dur, (int)eff, buy, cyc.local);
-                    if (sim >= buy) continue;
-                    if (!ByPriceK(c, g, cyc.k, cyc.dur, cyc.local, start, buy, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                    hits.Add(g);
-                }
-                parts[w] = hits;
-            });
-
-            long totalHits = 0;
-            for (int w = 0; w < workers; w++) totalHits += parts[w].Count;
-            var arr = new long[totalHits];
-            int dst = 0;
-            for (int w = 0; w < workers; w++)
-            {
-                parts[w].CopyTo(arr, dst);   // keep p-order: pages stay stable across rebuilds
-                dst += parts[w].Count;
-            }
-            return arr;
-        });
-    }
-
-
-    private static long[] ViewMatches(long now, string sig, uint key, Func<RealPlayer, bool> match,
-        int minBuyNow, int maxBuyNow, int minCurrent, int maxCurrent, int playStyle, string[] wantPos)
-    {
-        return FilterLookupOr(ViewFilterCache, ViewFilterLock, ViewFilterTtlSec, ViewFilterBytes, sig, now, () =>
-        {
-            long[] gs = Array.Empty<long>();
-            var mc = new List<int>();
-            for (int i = 0; i < Cards.Length; i++) if (match(Cards[i])) mc.Add(i);
-            if (mc.Count > 0)
-            {
-                var vPrefix = new long[mc.Count + 1];
-                long acc = 0;
-                for (int k = 0; k < mc.Count; k++) { acc += Counts[mc[k]]; vPrefix[k + 1] = acc; }
-                long vTotal = acc;
-                int vHalf = HalfBitsFor(vTotal);
-
-                int workers = Math.Max(1, Environment.ProcessorCount);
-                var parts = new List<long>[workers];
-                System.Threading.Tasks.Parallel.For(0, workers, w =>
-                {
-                    long lo = (long)w * vTotal / workers;
-                    long hi = (long)(w + 1) * vTotal / workers;
-                    var local = new List<long>((int)Math.Min(hi - lo, 4096));
-                    for (long p = lo; p < hi; p++)
-                    {
-                        long fg = PermuteView(p, vTotal, vHalf, key);
-                        int k = LocateIn(vPrefix, fg);
-                        int ci = mc[k];
-                        long g = Prefix[ci] + (fg - vPrefix[k]);   // real global index -> stable tradeId
-                        var cyc = Cycle(g, now);
-                        if (cyc.local >= cyc.dur || BoughtIn(g, cyc.k)) continue;
-                        RealPlayer c = Cards[ci];
-                        if (!StyleOkForK(c, g, cyc.k, playStyle)) continue;
-                        if (!PosOk(c, g, cyc.k, wantPos)) continue;
-                        var (start, buy) = Price(c, g, cyc.k);
-                        long eff = EffStart(c, g, cyc.k, cyc.dur, start, buy);
-                        var (_, sim, _, _) = SimBids(c, g, cyc.k, cyc.dur, (int)eff, buy, cyc.local);
-                        if (sim >= buy) continue;
-                        if (!ByPriceK(c, g, cyc.k, cyc.dur, cyc.local, start, buy, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                        local.Add(g);
-                    }
-                    parts[w] = local;
-                });
-                long totalHits = 0;
-                for (int w = 0; w < workers; w++) totalHits += parts[w].Count;
-                gs = new long[totalHits];
-                int dst = 0;
-                for (int w = 0; w < workers; w++)
-                {
-                    parts[w].CopyTo(gs, dst);   // p-order: pages stay stable across rebuilds
-                    dst += parts[w].Count;
-                }
-            }
-            return gs;
-        });
-    }
-
-    private readonly record struct SlotCtx(long K, long Start, long Dur, long Gap, long Local, int StartBid, int BuyNow);
-
-    private static long[] DomainMatches(long now, string sig, uint key, string domain,
-        List<int> mc, long[] prefix, int[] counts,
-        Func<long, long, SlotCtx> ctxOf,
-        Func<long, long, SlotCtx, bool> liveOk,
-        Func<long, long, SlotCtx, bool> priceOk)
-    {
-        string cacheKey = domain + "|" + sig;
-        return FilterLookupOr(DomainFilterCache, DomainFilterLock, ViewFilterTtlSec, DomainFilterBytes, cacheKey, now, () =>
-        {
-            long[] gs = Array.Empty<long>();
-            if (mc.Count > 0)
-            {
-                var vPrefix = new long[mc.Count + 1];
-                long acc = 0;
-                for (int k = 0; k < mc.Count; k++) { acc += counts[mc[k]]; vPrefix[k + 1] = acc; }
-                long vTotal = acc;
-                int vHalf = HalfBitsFor(vTotal);
-
-                int workers = Math.Max(1, Environment.ProcessorCount);
-                var parts = new List<long>[workers];
-                System.Threading.Tasks.Parallel.For(0, workers, w =>
-                {
-                    long lo = (long)w * vTotal / workers;
-                    long hi = (long)(w + 1) * vTotal / workers;
-                    var local = new List<long>((int)Math.Min(hi - lo, 4096));
-                    for (long p = lo; p < hi; p++)
-                    {
-                        long fg = PermuteView(p, vTotal, vHalf, key);
-                        int k = LocateIn(vPrefix, fg);
-                        int ci = mc[k];
-                        long g = prefix[ci] + (fg - vPrefix[k]);   // real global index -> stable tradeId
-                        var ctx = ctxOf(g, now);
-                        if (!liveOk(g, now, ctx)) continue;
-                        if (!priceOk(g, now, ctx)) continue;
-                        local.Add(g);
-                    }
-                    parts[w] = local;
-                });
-                long totalHits = 0;
-                for (int w = 0; w < workers; w++) totalHits += parts[w].Count;
-                gs = new long[totalHits];
-                int dst = 0;
-                for (int w = 0; w < workers; w++)
-                {
-                    parts[w].CopyTo(gs, dst);   // p-order: pages stay stable across rebuilds
-                    dst += parts[w].Count;
-                }
-            }
-            return gs;
-        });
-    }
-
-    private static bool BoughtIn(long g, long k) => BoughtAt.TryGetValue(g, out long kk) && kk == k;
-    private static bool CBoughtIn(long cg, long k) => CBoughtAt.TryGetValue(cg, out long kk) && kk == k;
-    private static bool EBoughtIn(long eg, long k) => EBoughtAt.TryGetValue(eg, out long kk) && kk == k;
-    private static bool FBoughtIn(long fg, long k) => FBoughtAt.TryGetValue(fg, out long kk) && kk == k;
-
-    private static bool CSimBinnedAt(long cg, SlotCtx ctx)
-    {
-        if (ctx.Local >= ctx.Dur) return false;
-        long eff = CEffStart(cg, ctx.K, ctx.Dur, ctx.StartBid, ctx.BuyNow);
-        int ci = LocateIn(CPrefix, cg);
-        var (_, sim, _, _) = CSimBids(CTier[ci], cg, ctx.K, ctx.Dur, (int)eff, ctx.BuyNow, ctx.Local);
-        return sim >= ctx.BuyNow;
-    }
-
-    private static bool CByPriceAt(long cg, SlotCtx ctx, int mnB, int mxB, int mnC, int mxC)
-    {
-        if (mnB <= 0 && mxB <= 0 && mnC <= 0 && mxC <= 0) return true;
-        int ci = LocateIn(CPrefix, cg);
-        if (mnB > 0 && ctx.BuyNow < mnB) return false;
-        if (mxB > 0 && ctx.BuyNow > mxB) return false;
-        if (mnC > 0 || mxC > 0)
-        {
-            long cur = ctx.StartBid;
-            if (ctx.Local < ctx.Dur)
-            {
-                var (_, sim, _, _) = CSimBids(CTier[ci], cg, ctx.K, ctx.Dur, ctx.StartBid, ctx.BuyNow, ctx.Local);
-                cur = sim;
-            }
-            if (mnC > 0 && cur < mnC) return false;
-            if (mxC > 0 && cur > mxC) return false;
-        }
-        return true;
-    }
-
-    private static bool ESimBinnedAt(long eg, SlotCtx ctx)
-    {
-        if (ctx.Local >= ctx.Dur) return false;
-        long eff = EEffStart(eg, ctx.K, ctx.Dur, ctx.StartBid, ctx.BuyNow);
-        int ci = LocateIn(EPrefix, eg);
-        var card = ECards[ci];
-        var (_, sim, _, _) = ESimBids(card.Rare, card.Rating, eg, ctx.K, ctx.Dur, (int)eff, ctx.BuyNow, ctx.Local);
-        return sim >= ctx.BuyNow;
-    }
-
-    private static bool EByPriceAt(long eg, SlotCtx ctx, int mnB, int mxB, int mnC, int mxC)
-    {
-        if (mnB <= 0 && mxB <= 0 && mnC <= 0 && mxC <= 0) return true;
-        int ci = LocateIn(EPrefix, eg);
-        if (mnB > 0 && ctx.BuyNow < mnB) return false;
-        if (mxB > 0 && ctx.BuyNow > mxB) return false;
-        if (mnC > 0 || mxC > 0)
-        {
-            long cur = ctx.StartBid;
-            if (ctx.Local < ctx.Dur)
-            {
-                var card = ECards[ci];
-                var (_, sim, _, _) = ESimBids(card.Rare, card.Rating, eg, ctx.K, ctx.Dur, ctx.StartBid, ctx.BuyNow, ctx.Local);
-                cur = sim;
-            }
-            if (mnC > 0 && cur < mnC) return false;
-            if (mxC > 0 && cur > mxC) return false;
-        }
-        return true;
-    }
-
-    private static bool FSimBinnedAt(long fg, SlotCtx ctx)
-    {
-        if (ctx.Local >= ctx.Dur) return false;
-        long eff = FEffStart(fg, ctx.K, ctx.Dur, ctx.StartBid, ctx.BuyNow);
-        int ci = LocateIn(FPrefix, fg);
-        int r = FIsManager[ci] ? FManager[ci].Rating : FStaff[ci].Rating;
-        var (_, sim, _, _) = FSimBids(r, FIsManager[ci], fg, ctx.K, ctx.Dur, (int)eff, ctx.BuyNow, ctx.Local);
-        return sim >= ctx.BuyNow;
-    }
-
-    private static bool FByPriceAt(long fg, SlotCtx ctx, int mnB, int mxB, int mnC, int mxC)
-    {
-        if (mnB <= 0 && mxB <= 0 && mnC <= 0 && mxC <= 0) return true;
-        int ci = LocateIn(FPrefix, fg);
-        if (mnB > 0 && ctx.BuyNow < mnB) return false;
-        if (mxB > 0 && ctx.BuyNow > mxB) return false;
-        if (mnC > 0 || mxC > 0)
-        {
-            long cur = ctx.StartBid;
-            if (ctx.Local < ctx.Dur)
-            {
-                int r = FIsManager[ci] ? FManager[ci].Rating : FStaff[ci].Rating;
-                var (_, sim, _, _) = FSimBids(r, FIsManager[ci], fg, ctx.K, ctx.Dur, ctx.StartBid, ctx.BuyNow, ctx.Local);
-                cur = sim;
-            }
-            if (mnC > 0 && cur < mnC) return false;
-            if (mxC > 0 && cur > mxC) return false;
-        }
-        return true;
-    }
-
     private static bool CByPrice(long cg, long now, int mnB, int mxB, int mnC, int mxC)
     {
         if (mnB <= 0 && mxB <= 0 && mnC <= 0 && mxC <= 0) return true;
@@ -1967,6 +1640,7 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         int minBuyNow = 0, int maxBuyNow = 0, int minCurrent = 0, int maxCurrent = 0, int playStyle = 0,
         string sig = null, string[] wantPos = null)
     {
+
         if (start < 0) start = 0;
         num = Math.Clamp(num, 1, 60);
         var rnd = new Random();
@@ -1976,30 +1650,11 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
 
         bool filtered = playStyle > 0 || minBuyNow > 0 || maxBuyNow > 0
                         || minCurrent > 0 || maxCurrent > 0 || (wantPos != null && wantPos.Length > 0);
-        long block = (long)num * (filtered ? 96 : 16);
+        long block = Math.Min(ServerOptions.Current.MarketScanLimit, (long)num * (filtered ? 96 : 16));
         long winStart = (scanFrom / Math.Max(1L, (long)num)) * block;
 
         if (match == null)
         {
-            if (playStyle > 0 && sig != null)
-            {
-                long[] gs = StyleFilterMatches(now, sig, key, minBuyNow, maxBuyNow, minCurrent, maxCurrent, playStyle, wantPos);
-                int from = start < gs.Length ? start : gs.Length;
-                for (int w = from; written < num && w < gs.Length; w++)
-                {
-                    long g = gs[w];
-                    if (!LiveAt(g, now) || BoughtThisCycle(g, now) || SimBinnedThisCycle(g, now)) continue;
-                    int i = Locate(g);
-                    RealPlayer c = Cards[i];
-                    if (!StyleOkFor(c, g, now, playStyle)) continue;
-                    if (!PosOkNow(c, g, now, wantPos)) continue;
-                    if (!ByPrice(c, g, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                    if (written > 0) sb.Append(',');
-                    sb.Append(Entry(c, g, now, rnd));
-                    written++;
-                }
-            }
-            else
             {
                 long scanCap = Math.Min(winStart + block, Total);   // never re-roll past the market domain
                 for (long p = winStart; written < num && p < scanCap; p++)
@@ -2018,25 +1673,6 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
         }
         else
         {
-            if (sig != null)
-            {
-                long[] gs = ViewMatches(now, sig, key, match, minBuyNow, maxBuyNow, minCurrent, maxCurrent, playStyle, wantPos);
-                int from = start < gs.Length ? start : gs.Length;
-                for (int w = from; written < num && w < gs.Length; w++)
-                {
-                    long g = gs[w];
-                    if (!LiveAt(g, now) || BoughtThisCycle(g, now) || SimBinnedThisCycle(g, now)) continue;
-                    int i = Locate(g);
-                    RealPlayer c = Cards[i];
-                    if (!StyleOkFor(c, g, now, playStyle)) continue;
-                    if (!PosOkNow(c, g, now, wantPos)) continue;
-                    if (!ByPrice(c, g, now, minBuyNow, maxBuyNow, minCurrent, maxCurrent)) continue;
-                    if (written > 0) sb.Append(',');
-                    sb.Append(Entry(c, g, now, rnd));
-                    written++;
-                }
-            }
-            else
             {
                 var mc = new List<int>();
                 for (int i = 0; i < Cards.Length; i++) if (match(Cards[i])) mc.Add(i);
@@ -2149,15 +1785,16 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
     internal static string SellerFor(long g, long k)
         => SellerNames[(int)(Hash((uint)g, (uint)(k * 0x9E3779B1u)) % (uint)SellerNames.Length)];
 
-    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> MyBids = new();
+    internal static System.Collections.Concurrent.ConcurrentDictionary<long, long> MyBids => PlayerContext.Current.Data.Market.MyBids;
 
-    internal static long HeldCoins;
-    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte> RefundedBids = new();
-    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte> Watched = new();
+    internal static long HeldCoins { get => PlayerContext.Current.Data.Market.HeldCoins; set => PlayerContext.Current.Data.Market.HeldCoins = value; }
+    internal static System.Collections.Concurrent.ConcurrentDictionary<long, byte> RefundedBids => PlayerContext.Current.Data.Market.RefundedBids;
+    internal static System.Collections.Concurrent.ConcurrentDictionary<long, byte> Watched => PlayerContext.Current.Data.Market.Watched;
 
     internal static void ChangeHeld(long delta)
     {
-        System.Threading.Interlocked.Add(ref HeldCoins, delta);
+        HeldCoins += delta;
+        PlayerContext.MarkDirty();
         if (HeldCoins < 0) HeldCoins = 0;
     }
 
@@ -2190,9 +1827,9 @@ internal static (long CurrentBid, int Offers, string BidState) AuctionState(long
     }
 
     internal readonly record struct PendingOffer(long Bid, long OfferedItemId, long AcceptAtUnix, long SettledAt = 0);
-    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<long, PendingOffer> AcceptedOffers = new();
+    internal static System.Collections.Concurrent.ConcurrentDictionary<long, PendingOffer> AcceptedOffers => PlayerContext.Current.Data.Market.AcceptedOffers;
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<long, long> BoughtAt = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<long, long> BoughtAt => PlayerContext.Current.Data.Market.BoughtAt;
 
     internal static void MarkBought(long tradeId, long now)
     {

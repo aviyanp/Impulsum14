@@ -15,10 +15,10 @@ internal static class SpecialCards
         LoadFile(Path.Combine(AppContext.BaseDirectory, "FUTDB", "specials.tsv"), list, bases);
 
         foreach (var clash in list.GroupBy(p => p.ResourceId).Where(g => g.Count() > 1))
-            Console.WriteLine($"[Specials] ERROR duplicate resourceId {clash.Key} on baseId " +
+            ServerDiagnostics.Write($"[Specials] ERROR duplicate resourceId {clash.Key} on baseId " +
                               $"{clash.First().Id} ({clash.Count()} cards) - give each row its own band");
 
-        return list.Concat(Probe(list)).ToArray();
+        return list.Concat(Probe(list)).Concat(Legends.Enabled).ToArray();
     }
 
     private static void LoadFile(string path, List<RealPlayer> list, Dictionary<int, RealPlayer> bases)
@@ -38,7 +38,7 @@ internal static class SpecialCards
                 int baseId = int.Parse(c[3]);
                 if (!bases.TryGetValue(baseId, out var b))
                 {
-                    Console.WriteLine($"[Specials] {path}:{lineNo} baseId {baseId} is not in players.tsv, skipping");
+                    ServerDiagnostics.Write($"[Specials] {path}:{lineNo} baseId {baseId} is not in players.tsv, skipping");
                     continue;
                 }
                 int rating = int.Parse(c[5]);
@@ -55,11 +55,11 @@ internal static class SpecialCards
         }
         catch (FileNotFoundException)
         {
-            Console.WriteLine($"[Specials] no {path}, skipping");
+            ServerDiagnostics.Write($"[Specials] no {path}, skipping");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Specials] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
+            ServerDiagnostics.Write($"[Specials] FAILED to load {path}: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -88,9 +88,9 @@ internal static class SpecialCards
                 ResourceId = b.Id + ProbeBand * Band,
                 Set = "probe",
             });
-            Console.WriteLine($"[Specials] probe rareflag={flag} -> rating {rating}, base player {b.Id} ({b.Position})");
+            ServerDiagnostics.Write($"[Specials] probe rareflag={flag} -> rating {rating}, base player {b.Id} ({b.Position})");
         }
-        Console.WriteLine($"[Specials] probing rareflag {from}..{to}: read the flag off a card as {99 + from} minus its rating");
+        ServerDiagnostics.Write($"[Specials] probing rareflag {from}..{to}: read the flag off a card as {99 + from} minus its rating");
         return probes;
     }
 }

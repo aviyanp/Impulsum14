@@ -1,7 +1,15 @@
 using System.Collections.Specialized;
+using System.Diagnostics;
+using BadHttpRequestException = Microsoft.AspNetCore.Http.BadHttpRequestException;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.Hosting;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 namespace Impulsum14;
@@ -11,21 +19,21 @@ internal sealed class WebServer
     private readonly ILogger _log;
     private readonly int _port;
     private readonly string _contentRoot;
-    private TcpListener _listener = null!;
+    private readonly Dictionary<string, (byte[] Bytes, string Type)> _staticFiles = new(StringComparer.OrdinalIgnoreCase);
 
-    private string _lastPackItemList = "";
-    private string _lastPurchaseResponseBody = "";
-
-    private readonly object _pendingLock = new();
-    private readonly List<(long Id, string Json)> _pendingPackItems = new();
-    private readonly List<(long NewId, long OwnedId)> _pendingDuplicates = new();
-
+    private string _lastPackItemList { get => PlayerContext.Current.Data.LastPackItemList; set { PlayerContext.Current.Data.LastPackItemList = value; PlayerContext.MarkDirty(); } }
+    private string _lastPurchaseResponseBody { get => PlayerContext.Current.Data.LastPurchaseResponseBody; set { PlayerContext.Current.Data.LastPurchaseResponseBody = value; PlayerContext.MarkDirty(); } }
+    private object _pendingLock => PlayerContext.Current.Sync;
+    private List<(long Id, string Json)> _pendingPackItems => PlayerContext.Current.Data.PendingPackItems;
+    private List<(long NewId, long OwnedId)> _pendingDuplicates => PlayerContext.Current.Data.PendingDuplicates;
 
     public WebServer(int port, ILogger log)
     {
         _port = port;
         _log = log;
         _contentRoot = FindContentRoot();
+        foreach (string file in Directory.EnumerateFiles(_contentRoot, "*", SearchOption.AllDirectories))
+            _staticFiles[Path.GetFullPath(file)] = (File.ReadAllBytes(file), Path.GetExtension(file).ToLowerInvariant() switch { ".json" => "application/json; charset=utf-8", ".xml" => "text/xml; charset=utf-8", ".png" => "image/png", ".csv" => "text/csv; charset=utf-8", _ => "application/octet-stream" });
         _log.LogInformation("OSDK web content root: {0}", _contentRoot);
     }
 
@@ -42,214 +50,177 @@ internal sealed class WebServer
         return Path.Combine(AppContext.BaseDirectory, "web");
     }
 
-    public void StartBotMarketLoop()
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        var th = new Thread(() =>
+        var options = ServerOptions.Current;
+        var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = Array.Empty<string>() });
+        builder.Logging.ClearProviders();
+        builder.WebHost.ConfigureKestrel(k =>
         {
-            while (true)
-            {
-                try
-                {
-                    long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    SettleWonBids(now);
-                    SettleBotBuys(now);
-                    SettleExpiredListings(now);
-                    SettleAcceptedOffers(now);
-                    ReconcileBids(now);
-                    Market.TryAdvanceFeed(now);
-                    Market.RefreshLiveTotal(now);
-                }
-                catch (Exception ex)
-                {
-                    _log.LogError("bot market tick failed: {0}", ex.Message);
-                }
-                Thread.Sleep(1000);
-            }
-        })
-        { IsBackground = true, Name = "BotMarketSim" };
-        th.Start();
-    }
-
-    public async Task StartAsync()
-    {
-        _listener = new TcpListener(IPAddress.Loopback, _port);
-        try { _listener.Start(); }
-        catch (SocketException ex) { _log.LogError("WebServer failed to bind :{Port} ({Error})", _port, ex.Message); return; }
-
-        _log.LogInformation("OSDK web listener up on http://127.0.0.1:{0}/", _port);
-
-        while (true)
+            k.Listen(IPAddress.Parse(options.BindAddress), _port, listen => listen.Protocols = HttpProtocols.Http1);
+            k.Limits.MaxConcurrentConnections = options.MaxConnections;
+            k.Limits.MaxRequestBodySize = options.MaxBodyBytes;
+            k.Limits.MaxRequestHeadersTotalSize = 16384;
+            k.Limits.MaxRequestHeaderCount = 64;
+            k.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(10);
+            k.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(options.IdleTimeoutSeconds);
+            k.AddServerHeader = false;
+        });
+        await using var app = builder.Build();
+        app.Run(HandleHttpAsync);
+        await app.StartAsync(cancellationToken);
+        _log.LogInformation("Web service listening on {Address}:{Port}", options.BindAddress, _port);
+        using var maintenanceStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var maintenance = MaintenanceAsync(maintenanceStop.Token);
+        var shutdown = app.WaitForShutdownAsync(cancellationToken);
+        try { await await Task.WhenAny(shutdown, maintenance).ConfigureAwait(false); }
+        finally
         {
-            TcpClient client;
-            try { client = await _listener.AcceptTcpClientAsync(); }
-            catch (Exception ex) when (ex is SocketException or ObjectDisposedException) { break; }
-            _ = HandleClientAsync(client);
+            maintenanceStop.Cancel();
+            await app.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            await maintenance.ConfigureAwait(false);
         }
     }
 
-    private async Task HandleClientAsync(TcpClient client)
+    private async Task MaintenanceAsync(CancellationToken cancel)
     {
-        using (client)
+        var options = ServerOptions.Current;
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1.0 / options.TickRate));
+        long nextAccountSweep = 0, nextRankedSweep = 0;
+        try
         {
-            client.NoDelay = true;
-            using var stream = new BufferedStream(client.GetStream(), 16384);
-            try
+            while (await timer.WaitForNextTickAsync(cancel))
             {
-                while (true)
+                long tick = Environment.TickCount64;
+                if (tick >= nextAccountSweep)
                 {
-                    WebReq req;
-                    try { req = await ReadRequestAsync(stream); }
-                    catch { break; }
-                    if (req is null) break;   // connection closed
-
-                    bool keepAlive = !string.Equals(req.Headers["Connection"], "close", StringComparison.OrdinalIgnoreCase);
-                    byte[] response;
-                    try { response = BuildResponse(req, keepAlive); }
-                    catch (Exception ex)
+                    nextAccountSweep = tick + options.MaintenanceIntervalMs;
+                    foreach (var player in PlayerRepository.Instance.LoadedPlayers)
                     {
-                        _log.LogWarning("WebServer handler error: {0}", ex.Message);
-                        response = BuildBytes("500 Internal Server Error", "text/plain", Array.Empty<byte>(), null, false);
-                        keepAlive = false;
+                        await PlayerRepository.Instance.TryRunMaintenanceAsync(player, () =>
+                        {
+                            MaintainPlayer(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                            return Task.CompletedTask;
+                        }, cancel);
                     }
-
-                    await stream.WriteAsync(response);
-                    await stream.FlushAsync();
-                    if (!keepAlive) break;
                 }
+                PlayerRepository.Instance.PruneSessions();
+                GameManagerComponent.Instance?.ExpireQueue();
+                if (tick >= nextRankedSweep) { nextRankedSweep = tick + 1000; RankedService.Current?.ExpireMatches(); }
             }
-            catch (Exception ex) { _log.LogWarning("WebServer connection error: {0}", ex.Message); }
         }
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested) { }
     }
 
-    private static async Task<WebReq> ReadRequestAsync(Stream stream)
+    private void MaintainPlayer(long now)
     {
-        var header = new List<byte>(1024);
-        var one = new byte[1];
-        while (true)
-        {
-            int n = await stream.ReadAsync(one.AsMemory(0, 1));
-            if (n == 0) return null;
-            header.Add(one[0]);
-            int c = header.Count;
-            if (c >= 4 && header[c - 1] == 10 && header[c - 2] == 13 && header[c - 3] == 10 && header[c - 4] == 13) break;
-            if (c > 65536) return null;
-        }
+        var data = PlayerContext.Current.Data;
+        if (data.Market.MyBids.Count + data.Market.AcceptedOffers.Count + data.Club.Listings.Count == 0) return;
+        PlayerContext.MarkDirty();
+        SettleWonBids(now); SettleBotBuys(now); SettleExpiredListings(now); SettleAcceptedOffers(now); ReconcileBids(now);
+    }
 
-        var lines = Encoding.ASCII.GetString(header.ToArray()).Split("\r\n");
-        var parts = lines[0].Split(' ');
-        if (parts.Length < 2) return null;
-
-        var headers = new NameValueCollection(StringComparer.OrdinalIgnoreCase);
-        for (int i = 1; i < lines.Length; i++)
+    private async Task HandleHttpAsync(HttpContext context)
+    {
+        long started = Stopwatch.GetTimestamp();
+        try
         {
-            if (lines[i].Length == 0) continue;
-            int idx = lines[i].IndexOf(':');
-            if (idx > 0) headers[lines[i][..idx].Trim()] = lines[i][(idx + 1)..].Trim();
-        }
-
-        string body = "";
-        if (int.TryParse(headers["Content-Length"], out int len) && len > 0)
-        {
-            var buf = new byte[len];
-            int got = 0;
-            while (got < len)
+            if (context.Request.Path == "/healthz" || context.Request.Path == "/readyz")
             {
-                int n = await stream.ReadAsync(buf.AsMemory(got, len - got));
-                if (n == 0) break;
-                got += n;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync("{\"status\":\"ok\"}"); return;
             }
-            body = Encoding.UTF8.GetString(buf, 0, got);
+            if (context.Request.Path == "/metrics")
+            {
+                context.Response.ContentType = "text/plain; version=0.0.4";
+                await context.Response.WriteAsync(ServerMetrics.Render()); return;
+            }
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+            timeout.CancelAfter(TimeSpan.FromSeconds(ServerOptions.Current.RequestTimeoutSeconds));
+            var headers = new NameValueCollection(StringComparer.OrdinalIgnoreCase);
+            foreach (var h in context.Request.Headers) headers[h.Key] = h.Value.ToString();
+            using var reader = new StreamReader(context.Request.Body, Encoding.UTF8);
+            string body = await reader.ReadToEndAsync(timeout.Token);
+            if (body.Length > ServerOptions.Current.MaxBodyBytes) throw new BadHttpRequestException("Body too large.", 413);
+            string effectiveMethod = headers["X-HTTP-Method-Override"] ?? context.Request.Method;
+            bool futMutation = context.Request.Path.Value?.Contains("/ut/", StringComparison.OrdinalIgnoreCase) == true && effectiveMethod.ToUpperInvariant() is "POST" or "PUT";
+            if (body.TrimStart().StartsWith('{') || body.TrimStart().StartsWith('[') || (futMutation && body.Length > 0))
+            {
+                using var document = System.Text.Json.JsonDocument.Parse(body);
+                if (futMutation && context.Request.Path.Value?.Contains("/clientdata/", StringComparison.OrdinalIgnoreCase) != true && document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) throw new BadHttpRequestException("Expected a JSON object.", 400);
+            }
+            string raw = context.Request.PathBase + context.Request.Path + context.Request.QueryString;
+            var req = new WebReq(context.Request.Method, raw, headers, body, timeout.Token);
+            var publicAsset = TryPublicContent(req.Url.AbsolutePath);
+            if (publicAsset is not null && req.HttpMethod is "GET" or "HEAD")
+            {
+                context.Response.StatusCode = publicAsset.Status; context.Response.ContentType = publicAsset.Type;
+                context.Response.ContentLength = publicAsset.Body.Length;
+                if (req.HttpMethod != "HEAD") await context.Response.Body.WriteAsync(publicAsset.Body, timeout.Token);
+                return;
+            }
+            var session = PlayerRepository.Instance.ResolveWeb(headers);
+            if (!session.Account.AcceptRequest()) throw new BadHttpRequestException("Request rate exceeded.", 429);
+            if (long.TryParse(headers["Easw-Session-Data-Nucleus-Id"], out long claimed) && claimed != session.Account.Id)
+                throw new UnauthorizedAccessException("Persona does not match session.");
+            var reply = await PlayerRepository.Instance.RunAsync(session, async () =>
+            {
+                MaintainPlayer(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                // Lists and pending claims are part of the same durable transaction as purchases.
+                if (req.HttpMethod is not ("GET" or "HEAD" or "OPTIONS")) PlayerContext.MarkDirty();
+                return await ResponseAsync(req).ConfigureAwait(false);
+            }, timeout.Token);
+            context.Response.StatusCode = reply.Status;
+            context.Response.ContentType = reply.Type;
+            foreach (string key in reply.Headers) context.Response.Headers[key] = reply.Headers[key];
+            context.Response.ContentLength = reply.Body.Length;
+            if (context.Request.Method != "HEAD") await context.Response.Body.WriteAsync(reply.Body, timeout.Token);
         }
-
-        return new WebReq(parts[0], parts[1], headers, body);
+        catch (UnauthorizedAccessException) { await HttpError(context, 401, "AUTHENTICATION_REQUIRED"); }
+        catch (BadHttpRequestException ex) { await HttpError(context, ex.StatusCode, "INVALID_REQUEST"); }
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or FormatException or InvalidDataException or ArgumentException or OverflowException)
+        { await HttpError(context, 400, "INVALID_REQUEST"); }
+        catch (OperationCanceledException) { if (!context.RequestAborted.IsCancellationRequested) await HttpError(context, 408, "REQUEST_TIMEOUT"); }
+        catch (Exception ex) { _log.LogError(ex, "Request failed: {Method} {Path}", context.Request.Method, context.Request.Path); await HttpError(context, 500, "SERVER_ERROR"); }
+        finally { ServerMetrics.Record(Stopwatch.GetElapsedTime(started).TotalMilliseconds, context.Response.StatusCode); }
     }
 
-    private byte[] BuildResponse(WebReq req, bool keepAlive)
+    private static async Task HttpError(HttpContext context, int status, string code)
     {
-        var sb = new StringBuilder();
-        sb.AppendLine($"[WEB] {req.HttpMethod} {req.RawUrl}");
-        foreach (string h in req.Headers)
-            sb.AppendLine($"        {h}: {req.Headers[h]}");
-        if (req.Body.Length > 0)
-            sb.AppendLine($"      body({req.Body.Length}): {Trim(req.Body, 2048)}");
-        _log.LogInformation(sb.ToString().TrimEnd());
+        if (context.Response.HasStarted) { context.Abort(); return; }
+        context.Response.Clear(); context.Response.StatusCode = status; context.Response.ContentType = "application/json";
+        await context.Response.WriteAsync("{\"reason\":\"" + code + "\"}");
+    }
 
+    private async Task<HttpReply> ResponseAsync(WebReq req)
+    {
+        var options = ServerOptions.Current;
+        string path = req.Url.AbsolutePath.ToLowerInvariant();
+        bool cacheable = req.HttpMethod == "GET" && req.Body.Length == 0 && options.ResponseCacheBytes > 0 && options.ResponseCacheEntries > 0 &&
+            (path.EndsWith("/user/credits") || path.EndsWith("/club") || path.Contains("/club/consumables") || path.EndsWith("/squad/active") || path.EndsWith("/squad/list") || path.EndsWith("/transfermarket"));
+        if (!cacheable) return await BuildResponseAsync(req, true).ConfigureAwait(false);
+        var account = PlayerContext.Current;
+        long second = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        string key = PlayerContext.Session.Key + "|" + req.RawUrl;
+        if (!account.Dirty && account.HttpCache.TryGetValue(key, out var hit) && hit.Revision == account.Revision && hit.Second == second) return hit.Reply;
+        var reply = await BuildResponseAsync(req, true).ConfigureAwait(false);
+        if (reply.Body.Length > options.ResponseCacheBytes) return reply;
+        foreach (var stale in account.HttpCache.Where(p => p.Value.Revision != account.Revision || p.Value.Second != second || p.Key == key).Select(p => p.Key).ToArray())
+        { account.HttpCacheBytes -= account.HttpCache[stale].Reply.Body.Length; account.HttpCache.Remove(stale); }
+        while (account.HttpCache.Count > 0 && (account.HttpCache.Count >= options.ResponseCacheEntries || account.HttpCacheBytes + reply.Body.Length > options.ResponseCacheBytes))
+        { string first = account.HttpCache.Keys.First(); account.HttpCacheBytes -= account.HttpCache[first].Reply.Body.Length; account.HttpCache.Remove(first); }
+        account.HttpCache[key] = new(account.Revision, second, reply);
+        account.HttpCacheBytes += reply.Body.Length;
+        return reply;
+    }
+
+    private async Task<HttpReply> BuildResponseAsync(WebReq req, bool keepAlive)
+    {
+        _log.LogDebug("{Method} {Path}", req.HttpMethod, req.Url.AbsolutePath);
         string lp = (req.Url?.AbsolutePath ?? "").ToLowerInvariant();
         var extra = new NameValueCollection();
 
-        int i2014 = lp.IndexOf("/2014/", StringComparison.Ordinal);
-        if (i2014 >= 0)   // serve any real live-content file we have (roster .bin, metadata/fixtures .json, gotw assets)
-        {
-            string rel = (req.Url?.AbsolutePath ?? "").Substring(i2014 + 6).TrimStart('/');
-            string root = Path.GetFullPath(_contentRoot);
-            string file = Path.GetFullPath(Path.Combine(root, rel.Replace('/', Path.DirectorySeparatorChar)));
-            if (file.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(file))
-            {
-                var fbytes = File.ReadAllBytes(file);
-                string ct = Path.GetExtension(file).ToLowerInvariant() switch
-                {
-                    ".json" => "application/json; charset=utf-8",
-                    ".xml"  => "text/xml; charset=utf-8",
-                    ".png"  => "image/png",
-                    _       => "application/octet-stream",
-                };
-                _log.LogInformation("      -> static {0} ({1} bytes)", rel, fbytes.Length);
-                return BuildBytes("200 OK", ct, fbytes, extra, keepAlive);
-            }
-        }
-
-        const string dmPrefix = "/fut/dynamicmessages/";
-        int idm = lp.IndexOf(dmPrefix, StringComparison.Ordinal);
-        if (idm >= 0)
-        {
-            string rel = (req.Url?.AbsolutePath ?? "").Substring(idm + dmPrefix.Length).TrimStart('/');
-            string root = Path.GetFullPath(Path.Combine(_contentRoot, "dynamicmessages"));
-            string file = Path.GetFullPath(Path.Combine(root, rel.Replace('/', Path.DirectorySeparatorChar)));
-            if (file.StartsWith(root, StringComparison.OrdinalIgnoreCase) && File.Exists(file))
-            {
-                var fbytes = File.ReadAllBytes(file);
-                string ct = Path.GetExtension(file).ToLowerInvariant() switch
-                {
-                    ".json" => "application/json; charset=utf-8",
-                    ".xml"  => "text/xml; charset=utf-8",
-                    ".png"  => "image/png",
-                    _       => "application/octet-stream",
-                };
-                _log.LogInformation("      -> dynamicmessages {0} ({1} bytes)", rel, fbytes.Length);
-                return BuildBytes("200 OK", ct, fbytes, extra, keepAlive);
-            }
-            _log.LogWarning("      -> dynamicmessages MISS (no mirror for {0})", rel);
-
-            if (rel.StartsWith("fut/items/pc/", StringComparison.OrdinalIgnoreCase)
-                && rel.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
-                && int.TryParse(System.IO.Path.GetFileNameWithoutExtension(rel), out int trophyId)
-                && trophyId >= 8200000)
-            {
-                if (trophyId >= 8202000)
-                {
-                    string sjson = Seasons.TrophyJson(trophyId - 8202000);
-                    _log.LogInformation("      -> season trophy item json {0} entry={1}", rel, trophyId - 8202000);
-                    return BuildBytes("200 OK", "application/json; charset=utf-8",
-                                      System.Text.Encoding.UTF8.GetBytes(sjson), extra, keepAlive);
-                }
-                int tourneyId = trophyId - 8200000;   // trophyResourceId 8200000+S -> tournamentId S
-                Tournaments.ActiveTournamentId = tourneyId;
-                string tjson = Tournaments.TrophyJson(tourneyId);
-                _log.LogInformation("      -> trophy item json {0} tournamentId={1} (TOURNY_LOC key)",
-                    rel, tourneyId);
-                return BuildBytes("200 OK", "application/json; charset=utf-8",
-                                  System.Text.Encoding.UTF8.GetBytes(tjson), extra, keepAlive);
-            }
-
-            if (rel.StartsWith("fut/items/", StringComparison.OrdinalIgnoreCase))
-            {
-                _log.LogInformation("      -> 404 (CDN-style miss for {0})", rel);
-                return BuildBytes("404 Not Found", "text/plain; charset=utf-8",
-                                  System.Text.Encoding.UTF8.GetBytes("Not Found"), extra, keepAlive);
-            }
-        }
-
-        var (contentType, payloadStr) = Route(req);
+        var (contentType, payloadStr) = await RouteAsync(req).ConfigureAwait(false);
 
         if (lp.Contains("/rs4") || lp.StartsWith("/fut") || lp.Contains("accountinfo") || lp.Contains("/ut/"))
         {
@@ -293,23 +264,89 @@ internal sealed class WebServer
         return BuildBytes(status, contentType, payload, extra, keepAlive);
     }
 
-    private static byte[] BuildBytes(string status, string contentType, byte[] body, NameValueCollection extra, bool keepAlive)
+    private HttpReply TryPublicContent(string absolutePath)
     {
-        var sb = new StringBuilder();
-        sb.Append("HTTP/1.1 ").Append(status).Append("\r\n");
-        sb.Append("Date: ").Append(DateTime.UtcNow.ToString("r")).Append("\r\n");
-        sb.Append("Content-Type: ").Append(contentType).Append("\r\n");
-        sb.Append("Content-Length: ").Append(body.Length).Append("\r\n");
-        if (extra != null)
-            foreach (string k in extra.Keys)
-                if (k != null) sb.Append(k).Append(": ").Append(extra[k]).Append("\r\n");
-        sb.Append("Connection: ").Append(keepAlive ? "keep-alive" : "close").Append("\r\n\r\n");
-        var head = Encoding.ASCII.GetBytes(sb.ToString());
-        var result = new byte[head.Length + body.Length];
-        Buffer.BlockCopy(head, 0, result, 0, head.Length);
-        Buffer.BlockCopy(body, 0, result, head.Length, body.Length);
-        return result;
+        string lp = absolutePath.ToLowerInvariant();
+        var extra = new NameValueCollection();
+        int i2014 = lp.IndexOf("/2014/", StringComparison.Ordinal);
+        if (i2014 >= 0)   // serve any real live-content file we have (roster .bin, metadata/fixtures .json, gotw assets)
+        {
+            string rel = Uri.UnescapeDataString(absolutePath).Substring(i2014 + 6).TrimStart('/');
+            string root = Path.GetFullPath(_contentRoot);
+            string file = Path.GetFullPath(Path.Combine(root, rel.Replace('/', Path.DirectorySeparatorChar)));
+            if (file.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.Ordinal) && _staticFiles.ContainsKey(file))
+            {
+                var fbytes = _staticFiles[file].Bytes;
+                string ct = Path.GetExtension(file).ToLowerInvariant() switch
+                {
+                    ".json" => "application/json; charset=utf-8",
+                    ".xml"  => "text/xml; charset=utf-8",
+                    ".png"  => "image/png",
+                    _       => "application/octet-stream",
+                };
+                _log.LogInformation("      -> static {0} ({1} bytes)", rel, fbytes.Length);
+                return BuildBytes("200 OK", ct, fbytes, extra, true);
+            }
+        }
+
+        const string dmPrefix = "/fut/dynamicmessages/";
+        int idm = lp.IndexOf(dmPrefix, StringComparison.Ordinal);
+        if (idm >= 0)
+        {
+            string rel = Uri.UnescapeDataString(absolutePath).Substring(idm + dmPrefix.Length).TrimStart('/');
+            string root = Path.GetFullPath(Path.Combine(_contentRoot, "dynamicmessages"));
+            string file = Path.GetFullPath(Path.Combine(root, rel.Replace('/', Path.DirectorySeparatorChar)));
+            if (file.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.Ordinal) && _staticFiles.ContainsKey(file))
+            {
+                var fbytes = _staticFiles[file].Bytes;
+                string ct = Path.GetExtension(file).ToLowerInvariant() switch
+                {
+                    ".json" => "application/json; charset=utf-8",
+                    ".xml"  => "text/xml; charset=utf-8",
+                    ".png"  => "image/png",
+                    _       => "application/octet-stream",
+                };
+                _log.LogInformation("      -> dynamicmessages {0} ({1} bytes)", rel, fbytes.Length);
+                return BuildBytes("200 OK", ct, fbytes, extra, true);
+            }
+            _log.LogWarning("      -> dynamicmessages MISS (no mirror for {0})", rel);
+
+            if (rel.StartsWith("fut/items/pc/", StringComparison.OrdinalIgnoreCase)
+                && rel.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(System.IO.Path.GetFileNameWithoutExtension(rel), out int trophyId)
+                && trophyId >= 8200000)
+            {
+                if (trophyId >= 8202000)
+                {
+                    string sjson = Seasons.TrophyJson(trophyId - 8202000);
+                    _log.LogInformation("      -> season trophy item json {0} entry={1}", rel, trophyId - 8202000);
+                    return BuildBytes("200 OK", "application/json; charset=utf-8",
+                                      System.Text.Encoding.UTF8.GetBytes(sjson), extra, true);
+                }
+                int tourneyId = trophyId - 8200000;   // trophyResourceId 8200000+S -> tournamentId S
+
+                string tjson = Tournaments.TrophyJson(tourneyId);
+                _log.LogInformation("      -> trophy item json {0} tournamentId={1} (TOURNY_LOC key)",
+                    rel, tourneyId);
+                return BuildBytes("200 OK", "application/json; charset=utf-8",
+                                  System.Text.Encoding.UTF8.GetBytes(tjson), extra, true);
+            }
+
+            if (rel.StartsWith("fut/items/", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.LogInformation("      -> 404 (CDN-style miss for {0})", rel);
+                return BuildBytes("404 Not Found", "text/plain; charset=utf-8",
+                                  System.Text.Encoding.UTF8.GetBytes("Not Found"), extra, true);
+            }
+        }
+
+
+        if (lp.Contains("/2014/") || lp.Contains("/fut/dynamicmessages/")) return BuildBytes("404 Not Found", "text/plain", Array.Empty<byte>(), extra, true);
+        return null;
     }
+
+    private static HttpReply BuildBytes(string status, string contentType, byte[] body, NameValueCollection extra, bool keepAlive)
+        => new(int.Parse(status.AsSpan(0, 3), System.Globalization.CultureInfo.InvariantCulture), contentType, body, extra ?? new());
 
     // Lightweight stand-in for HttpListenerRequest so the routing code below is unchanged.
     private sealed class WebReq
@@ -320,10 +357,13 @@ internal sealed class WebServer
         public NameValueCollection Headers { get; }
         public NameValueCollection QueryString { get; }
         public string Body { get; }
+        public CancellationToken CancellationToken { get; }
 
-        public WebReq(string method, string rawUrl, NameValueCollection headers, string body)
+        public WebReq(string method, string rawUrl, NameValueCollection headers, string body, CancellationToken cancellationToken = default)
         {
-            HttpMethod = method;
+            CancellationToken = cancellationToken;
+            HttpMethod = (headers["X-HTTP-Method-Override"] ?? method).ToUpperInvariant();
+            if (HttpMethod is not ("GET" or "HEAD" or "POST" or "PUT" or "DELETE" or "OPTIONS")) throw new BadHttpRequestException("Unsupported method.", 405);
             RawUrl = rawUrl;
             Headers = headers;
             Body = body ?? "";
@@ -332,15 +372,40 @@ internal sealed class WebServer
             foreach (var part in Url.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
             {
                 int eq = part.IndexOf('=');
-                if (eq >= 0) QueryString[Uri.UnescapeDataString(part[..eq])] = Uri.UnescapeDataString(part[(eq + 1)..]);
+                if (eq >= 0) QueryString[Uri.UnescapeDataString(part[..eq])] = Uri.UnescapeDataString(part[(eq + 1)..].Replace("+", " "));
                 else QueryString[Uri.UnescapeDataString(part)] = "";
             }
+            foreach (string key in new[] { "count", "num" })
+                if (QueryString[key] is string count)
+                    QueryString[key] = (int.TryParse(count, out int n) ? Math.Clamp(n, 1, ServerOptions.Current.MaxPageSize) : 50).ToString();
+            foreach (string key in new[] { "start", "offset" })
+                if (QueryString[key] is string offset)
+                    QueryString[key] = (int.TryParse(offset, out int n) ? Math.Clamp(n, 0, 100000) : 0).ToString();
         }
     }
 
-    private (string, string) Route(WebReq req)
+    private async Task<(string, string)> RouteAsync(WebReq req)
     {
         string path = (req.Url?.AbsolutePath ?? "").ToLowerInvariant();
+        if (path.Contains("/ranked/")) return RankedRoute(req, path);
+        if (path.EndsWith("/legends")) return ("application/json; charset=utf-8", Legends.Json());
+        if (path.EndsWith("/managerquest"))
+            return ("application/json; charset=utf-8", req.HttpMethod switch
+            {
+                "GET" => ManagerTasks.NativeJson(),
+                "POST" or "PUT" => ManagerTasks.SaveNative(req.Body),
+                _ => throw new BadHttpRequestException("Unsupported manager quest method.", 405)
+            });
+        if (path.Contains("/managertask") || path.Contains("/manager/tasks") || path.Contains("/manager/challenge") || path.EndsWith("/clientdata/managertasks"))
+        {
+            if (req.HttpMethod is "POST" or "PUT")
+            {
+                string tail = path.TrimEnd('/').Split('/').Last();
+                int id = int.TryParse(tail, out int taskId) ? taskId : 0;
+                return ("application/json; charset=utf-8", ManagerTasks.Claim(id));
+            }
+            return ("application/json; charset=utf-8", ManagerTasks.Json());
+        }
         bool wantsJson = (req.Headers["Accept"] ?? "").Contains("json", StringComparison.OrdinalIgnoreCase);
 
         // FUT/EASFC accountinfo. This is the EASFC backend ("rs4") handshake — the persona
@@ -360,6 +425,7 @@ internal sealed class WebServer
 
         if (path.Contains("/match/reset"))
         {
+            if (req.HttpMethod is "POST" or "PUT" or "DELETE") { MatchService.Reset(); }
             long balMR = FutProfileStore.Get().Coins;
             return ("application/json; charset=utf-8",
                     "{\"allCoins\":" + balMR + ",\"credits\":" + balMR + ",\"coins\":" + balMR +
@@ -367,74 +433,28 @@ internal sealed class WebServer
         }
         if (path.Contains("/match/end") || path.Contains("destroymatch"))
         {
-            string endReason = BodyRx(req.Body, "\"endReason\"\\s*:\\s*\"([^\"]*)\"");
-            bool isWin  = endReason.Equals("WIN",  StringComparison.OrdinalIgnoreCase);
-            bool isDraw = endReason.Equals("DRAW", StringComparison.OrdinalIgnoreCase)
-                       || endReason.Equals("TIE",  StringComparison.OrdinalIgnoreCase);
-            bool isDnf = endReason.Equals("DNF", StringComparison.OrdinalIgnoreCase);
-            int myGoals = 0;
-            var msm = System.Text.RegularExpressions.Regex.Match(req.Body, "\"myMatchStats\"\\s*:\\s*\\{([^}]*)\\}");
-            if (msm.Success && int.TryParse(BodyRx(msm.Groups[1].Value, "\"goals\"\\s*:\\s*(\\d+)"), out int g)) myGoals = g;
-
-            int matchCoins = (isWin ? 500 : isDraw ? 300 : 200) + myGoals * 20;
-
-            bool credited = req.HttpMethod is "PUT" or "POST";
-            int tournamentCoins = 0;
-            int? awardedCup = null;
-            long balME = FutProfileStore.Get().Coins;
-            if (credited)
-            {
-                if (!isDnf) ApplyMatchConsequences(req.Body);
-                if (Tournaments.CurrentMatchTournamentId is int tid)
-                {
-                    var (prize, wonFinal) = Tournaments.SettleTournamentMatch(tid, endReason);
-                    tournamentCoins = prize;
-                    if (wonFinal) awardedCup = tid;
-                    Tournaments.CurrentMatchTournamentId = null;   // guard against a double-settle
-                }
-                int total = matchCoins + tournamentCoins;
-                bool trophy = tournamentCoins > 0;
-                FutProfileStore.Mutate(p =>
-                {
-                    p.Coins += total;
-                    if (trophy) p.TrophiesWon++;
-                    if (!isDnf) { if (isWin) p.Wins++; else if (isDraw) p.Draws++; else p.Losses++; }   // hub W-D-L record
-                    balME = p.Coins;
-                });
-            }
-
-            if (awardedCup is int wonId)
-                _log.LogInformation("[FUT] tournament {0} WON -> +{1} match +{2} cup coins; trophies={3}; balance {4}",
-                    wonId, matchCoins, tournamentCoins, FutProfileStore.Get().TrophiesWon, balME);
-            else
-                _log.LogInformation("[FUT] match/end ({0}, {1} goals): +{2} coins -> {3}",
-                    string.IsNullOrEmpty(endReason) ? "?" : endReason, myGoals, credited ? matchCoins : 0, balME);
-            return ("application/json; charset=utf-8", MatchEndBody(balME, matchCoins, tournamentCoins));
+            if (req.HttpMethod is not ("POST" or "PUT")) throw new BadHttpRequestException("Match settlement requires POST or PUT.", 405);
+            return ("application/json; charset=utf-8", await MatchService.EndAsync(req.Body, ApplyMatchConsequences, req.CancellationToken).ConfigureAwait(false));
         }
 
         if (path.EndsWith("/match/ready") ||
             (path.EndsWith("/match") && req.HttpMethod == "PUT"))
         {
             long tsMR = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var readySquad = ResolveMatchSquad(req.Body);
+            var readySquad = MatchService.Ready(req.Body);
             return ("application/json; charset=utf-8",
                     "{\"startDateTime\":" + tsMR + ",\"squad\":" + BuildFullSquadJson(readySquad) + "}");
         }
 
         if (path.EndsWith("/match"))
         {
-            if (req.HttpMethod == "POST")
-            {
-                string t = BodyRx(req.Body, "\"tournamentId\"\\s*:\\s*(\\d+)");
-                Tournaments.CurrentMatchTournamentId = (int.TryParse(t, out int ti) && ti > 0) ? ti : (int?)null;
-            }
-            long tsCM = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            int matchId = System.Threading.Interlocked.Increment(ref _matchIdSeq);
+            if (req.HttpMethod != "POST") throw new BadHttpRequestException("Create match requires POST.", 405);
+            var match = MatchService.Begin(req.Body);
             var matchSquad = ResolveMatchSquad(req.Body);
             return ("application/json; charset=utf-8",
-                    "{\"id\":" + matchId + ",\"matchId\":" + matchId +
-                    ",\"matchLengthMin\":6,\"matchlength\":6,\"matchDifficulty\":3" +
-                    ",\"startDateTime\":" + tsCM +
+                    "{\"id\":" + match.Id + ",\"matchId\":" + match.Id +
+                    ",\"matchLengthMin\":6,\"matchlength\":6,\"matchDifficulty\":" + match.Difficulty +
+                    ",\"startDateTime\":" + match.CreatedAt +
                     ",\"squad\":" + BuildFullSquadJson(matchSquad) + "}");
         }
 
@@ -443,7 +463,17 @@ internal sealed class WebServer
             if (path.EndsWith("/teams") || path.Contains("tournamentteams"))
             {
                 int gid = int.TryParse(req.QueryString["groupId"], out int g) ? g : 0;
-                return ("application/json; charset=utf-8", Tournaments.TeamsJson(gid));
+                int count = int.TryParse(req.QueryString["count"], out int teamCount) ? teamCount : 15;
+                return ("application/json; charset=utf-8", Tournaments.TeamsJson(gid, count));
+            }
+
+            if (req.HttpMethod == "DELETE" || path.Contains("/delete/"))
+            {
+                if (req.HttpMethod is not ("POST" or "PUT" or "DELETE")) throw new BadHttpRequestException("Reset requires a mutation method.", 405);
+                if (!int.TryParse(path.TrimEnd('/').Split('/').Last(), out int resetId)) throw new BadHttpRequestException("Missing tournament identity.", 400);
+                if (PlayerContext.Current.Data.Match is { Settled: false } activeCup && activeCup.TournamentId == resetId) throw new BadHttpRequestException("Finish or reset the current match first.", 409);
+                Tournaments.Reset(resetId);
+                return ("application/json; charset=utf-8", "{}");
             }
 
             if (path.Contains("tournament/user"))
@@ -455,14 +485,11 @@ internal sealed class WebServer
                 if (haveId)
                 {
                     Tournaments.ActiveTournamentId = tid;
+                    PlayerContext.Current.Data.LastCompetition = "tournament";
+                    PlayerContext.MarkDirty();
                     if (req.HttpMethod is "POST" or "PUT")           // client saving its own bracket
                     {
-                        int round = int.TryParse(BodyRx(req.Body, "\"round\"\\s*:\\s*(\\d+)"), out int rd) ? rd : 1;
-                        int dv = int.TryParse(BodyRx(req.Body, "\"dataVersion\"\\s*:\\s*(\\d+)"), out int d) ? d : 1;
-                        int pdv = int.TryParse(BodyRx(req.Body, "\"progressDataVersion\"\\s*:\\s*(\\d+)"), out int pv) ? pv : 1;
-                        string echo = Tournaments.SaveProgress(tid, round, dv,
-                            Tournaments.CaptureString(req.Body, "tournamentData"), pdv,
-                            Tournaments.CaptureString(req.Body, "progressData"));
+                        string echo = Tournaments.SaveProgress(tid, req.Body);
                         return ("application/json; charset=utf-8", echo);
                     }
                     return ("application/json; charset=utf-8", Tournaments.UserTournamentJson(tid));
@@ -486,29 +513,36 @@ internal sealed class WebServer
 
         if (path.Contains("/season") || path.Contains("/division/"))
         {
+            bool onlineSeason = string.Equals(req.QueryString["type"], "online", StringComparison.OrdinalIgnoreCase);
             if (path.Contains("/squad/unlock"))
                 return ("application/json; charset=utf-8", "{}");
 
             if (path.Contains("reset"))
             {
-                int nd = Seasons.ParseResetDivision(path);
-                if (nd >= 0) FutProfileStore.Mutate(p => p.OfflineDivision = nd);
+                int nd = Seasons.ParseResetDivision(path, req.QueryString);
+                if (req.HttpMethod is not ("PUT" or "POST" or "DELETE")) throw new BadHttpRequestException("Reset requires a mutation method.", 405);
+                // Reset progress in the current division; clients cannot promote themselves by URL.
+                int currentDivision = onlineSeason ? FutProfileStore.Get().OnlineDivision : FutProfileStore.Get().OfflineDivision;
+                if (nd > 0 && nd != currentDivision) throw new BadHttpRequestException("Division changes require season settlement.", 409);
+                if (PlayerContext.Current.Data.Match is { Settled: false, Competition: "season" }) throw new BadHttpRequestException("Finish or reset the current match first.", 409);
+                FutProfileStore.Mutate(p => Seasons.Reset(p, onlineSeason));
                 return ("application/json; charset=utf-8",
-                        Seasons.ResetJson(nd >= 0 ? nd : FutProfileStore.Get().OfflineDivision));
+                        Seasons.ResetJson(currentDivision, onlineSeason));
             }
 
-            if (path.Contains("season/history"))
-                return ("application/json; charset=utf-8", Seasons.HistoryJson());
+            if ((path.Contains("season/history") || path.Contains("season/user/history")))
+                return ("application/json; charset=utf-8", Seasons.HistoryJson(req.QueryString["type"] is null ? null : onlineSeason));
 
             if (path.EndsWith("/user") || path.Contains("season/user"))
             {
+                if (!onlineSeason) { PlayerContext.Current.Data.LastCompetition = "season"; PlayerContext.MarkDirty(); }
                 if (req.HttpMethod is "PUT" or "POST")
-                    FutProfileStore.Mutate(p => Seasons.CaptureSave(p, req.Body));
-                return ("application/json; charset=utf-8", Seasons.UserJson(FutProfileStore.Get()));
+                    FutProfileStore.Mutate(p => Seasons.CaptureSave(p, req.Body, onlineSeason, path, req.QueryString));
+                return ("application/json; charset=utf-8", Seasons.UserJson(FutProfileStore.Get(), onlineSeason));
             }
 
             // The division ladder catalog (season/list, and any other season GET).
-            return ("application/json; charset=utf-8", Seasons.ListJson());
+            return ("application/json; charset=utf-8", Seasons.ListJson(req.QueryString));
         }
 
         if (path.EndsWith("/accountinfo"))
@@ -567,7 +601,7 @@ internal sealed class WebServer
         {
             long hubNow = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             var profHub = FutProfileStore.Get();
-            long coinsHub = profHub.Coins - Market.HeldCoins;   // available = balance minus escrowed bids
+            long coinsHub = profHub.Coins;   // wallet already excludes escrowed bids
             string currenciesHub = CurrenciesJson(coinsHub);
             var wl = Market.WatchlistCounts(hubNow);
             long liveListings = Market.LiveTotal(hubNow);
@@ -689,6 +723,7 @@ internal sealed class WebServer
             }
             catch (Exception ex) { _log.LogWarning("[FUT] auctionhouse body parse failed: {0}", ex.Message); }
 
+            if (startingBid < 150 || startingBid > 15000000 || buyNowPrice < 0 || buyNowPrice > 15000000 || (buyNowPrice > 0 && buyNowPrice < startingBid) || duration is < 60 or > 259200) throw new BadHttpRequestException("Invalid auction terms.", 400);
             if (auctionItemId == 0)
                 return ("application/json; charset=utf-8", "{}");
 
@@ -699,6 +734,7 @@ internal sealed class WebServer
             {
                 int idx = data.Inventory.FindIndex(c => c.ItemId == auctionItemId);
                 if (idx < 0) return;                       // can only list something you own
+                if (data.Listings.TryGetValue(auctionItemId, out var oldAuction) && oldAuction.State is "active" or "sold") throw new BadHttpRequestException("Auction already active or sold.", 409);
                 owned = true;
                 if (data.Inventory[idx].Pile != 3)         // listing implies it's on the transfer list
                     data.Inventory[idx] = new ClubItem(auctionItemId, data.Inventory[idx].Player, 3);
@@ -728,6 +764,7 @@ internal sealed class WebServer
 
             if (!owned)
                 return ("application/json; charset=utf-8", "{}");
+            ManagerTasks.Observe("list_player");
             _log.LogInformation("[FUT] listed item {0}: start {1}, buyNow {2}, {3}s -> tradeId {4}",
                 auctionItemId, startingBid, buyNowPrice, duration, newTradeId);
             return ("application/json; charset=utf-8", "{\"id\":" + newTradeId + "}");
@@ -751,7 +788,8 @@ internal sealed class WebServer
                         if (it.TryGetProperty("id", out var idEl) && idEl.ValueKind == System.Text.Json.JsonValueKind.Number)
                         { offeredId = idEl.GetInt64(); break; }
             }
-            catch (Exception ex) { _log.LogWarning("[FUT] bid body parse failed: {0}", ex.Message); }
+            catch (Exception) { throw new BadHttpRequestException("Invalid bid body.", 400); }
+            if (amount <= 0 && offeredId == 0) throw new BadHttpRequestException("A bid amount or owned offer item is required.", 400);
             return MarketBuy(buyTradeId, amount, offeredId);
         }
 
@@ -790,7 +828,7 @@ internal sealed class WebServer
                 tsSb.Append(entry);
             }
             tsSb.Append(']');
-            long tsCoins = FutProfileStore.Get().Coins - Market.HeldCoins;
+            long tsCoins = FutProfileStore.Get().Coins;
             return ("application/json; charset=utf-8",
                     "{\"auctionInfo\":" + tsSb + ",\"duplicateItemIdList\":null,\"errorState\":null," +
                     "\"credits\":" + tsCoins + ",\"totalCredits\":" + tsCoins + ",\"coins\":" + tsCoins +
@@ -814,6 +852,7 @@ internal sealed class WebServer
                 }
                 catch (Exception ex) { _log.LogWarning("[FUT] watchList body parse failed: {0}", ex.Message); }
             }
+            if (Market.Watched.Count >= 100 && req.HttpMethod == "PUT" && !Market.Watched.ContainsKey(tid)) throw new BadHttpRequestException("Watchlist capacity exceeded.", 409);
             if (tid >= Market.TradeIdBase)   // sim-market listings only; own listings are watched via the trade pile
             {
                 if (req.HttpMethod == "PUT")
@@ -853,7 +892,7 @@ internal sealed class WebServer
                 wlSb.Append(entry);
             }
             wlSb.Append(']');
-            long wlCoins = FutProfileStore.Get().Coins - Market.HeldCoins;
+            long wlCoins = FutProfileStore.Get().Coins;
             return ("application/json; charset=utf-8",
                     "{\"auctionInfo\":" + wlSb + ",\"total\":" + watched.Count +
                     ",\"duplicateItemIdList\":[],\"errorState\":null,\"credits\":" + wlCoins +
@@ -863,7 +902,7 @@ internal sealed class WebServer
 
         if (path.EndsWith("/tradepile"))
         {
-            long coinsTrade = FutProfileStore.Get().Coins - Market.HeldCoins;
+            long coinsTrade = FutProfileStore.Get().Coins;
             var tradeItems = ClubStore.Get().Inventory.Where(c => c.Pile == 3).ToArray();
             var listings = ClubStore.Get().Listings;
             var tpRnd = new Random();
@@ -945,6 +984,7 @@ internal sealed class WebServer
                     var ab = System.Text.RegularExpressions.Regex.Match(req.Body, "\"clubAbbr\"\\s*:\\s*\"([^\"]*)\"");
                     if (ab.Success && ab.Groups[1].Value.Length > 0) p.Club.Abbr = ab.Groups[1].Value;
                 });
+                ManagerTasks.Observe("rename_club");
                 string newName = FutProfileStore.Get().Club.Name;
                 ClubStore.Mutate(d =>
                 {
@@ -984,7 +1024,7 @@ internal sealed class WebServer
                     if (i > 0) csb.Append(',');
                     var c = cosmeticsPage[i];
                     if (c.Type == "ball")
-                        Console.WriteLine($"[FUT] BALL BROWSE itemId={c.ItemId} resourceId={c.ResourceId} assetId={c.AssetId}");
+                        ServerDiagnostics.Write($"[FUT] BALL BROWSE itemId={c.ItemId} resourceId={c.ResourceId} assetId={c.AssetId}");
                     string cState = c.Type switch
                     {
                         "ball"    => c.ResourceId == cosClub.ActiveBallId ? "activeBall" : "free",
@@ -1084,7 +1124,7 @@ internal sealed class WebServer
             string tmLev = (req.QueryString["lev"] ?? "").ToLowerInvariant();
             string tmPos = req.QueryString["pos"] ?? "";
             int tmStyle = int.TryParse(req.QueryString["playStyle"], out int tms) ? tms : 0;
-            long tmCoins = FutProfileStore.Get().Coins - Market.HeldCoins;
+            long tmCoins = FutProfileStore.Get().Coins;
             if (tmType is "clubinfo" or "stadium" or "stadiums" or "ball" or "balls"
                 or "kit" or "kits" or "badge" or "badges" or "custom")
             {
@@ -1129,9 +1169,8 @@ internal sealed class WebServer
         if (path.Contains("/club/stats/newcards"))
         {
             string ncStats = ClubStatBlockJson(5, 0);
-            string ncPurchase = _lastPurchaseResponseBody.Length > 0 ? _lastPurchaseResponseBody
-                : _lastPackItemList.Length > 0 ? "{\"itemList\":" + _lastPackItemList + "}"
-                : "{}";
+            string ncItems = "[" + string.Join(",", _pendingPackItems.Select(p => p.Json)) + "]";
+            string ncPurchase = "{\"itemList\":" + ncItems + ",\"itemIdList\":[" + string.Join(",", _pendingPackItems.Select(p => p.Id)) + "],\"numberItems\":" + _pendingPackItems.Count + ",\"credits\":" + FutProfileStore.Get().Coins + ",\"coins\":" + FutProfileStore.Get().Coins + ",\"duplicateItemIdList\":" + DuplicateListJson(_pendingDuplicates.Where(d => _pendingPackItems.Any(p => p.Id == d.NewId))) + "}";
             return ("application/json; charset=utf-8", ncStats[..^1] + "," + ncPurchase[1..]);
         }
 
@@ -1184,7 +1223,7 @@ internal sealed class WebServer
                     owned = data0.Consumables.FindIndex(c => c.ResourceId == itemPathNum);
                 if (owned < 0)
                 {
-                    Console.WriteLine($"[FUT] consumable apply: no owned copy of {(resourceForm ? "resource " : "item ") + itemPathNum} - the menu offered it but the club has none; consuming nothing");
+                    ServerDiagnostics.Write($"[FUT] consumable apply: no owned copy of {(resourceForm ? "resource " : "item ") + itemPathNum} - the menu offered it but the club has none; consuming nothing");
                     return ("application/json; charset=utf-8",
                         "{\"success\":false,\"resourceId\":" + itemPathNum + ",\"itemData\":[]}");
                 }
@@ -1202,11 +1241,11 @@ internal sealed class WebServer
                     _pendingPackItems.RemoveAll(p => p.Id == usedItemId);
                     _pendingDuplicates.RemoveAll(d => d.NewId == usedItemId);
                 }
-                Console.WriteLine($"[FUT] consumable {useResource} applied to {changedIds.Count} player(s); owned copy {usedItemId} consumed");
+                ServerDiagnostics.Write($"[FUT] consumable {useResource} applied to {changedIds.Count} player(s); owned copy {usedItemId} consumed");
                 return ("application/json; charset=utf-8", AppliedItemsJson(useResource, changedIds));
             }
 
-            Console.WriteLine($"[FUT] BALL PUT receivedItemId={itemPathNum}");
+            ServerDiagnostics.Write($"[FUT] BALL PUT receivedItemId={itemPathNum}");
             CosmeticItem equip = default;
             string equipSource = "";
             var data1 = ClubStore.Get();
@@ -1269,14 +1308,15 @@ internal sealed class WebServer
             }
             if (equip.ItemId == 0)
             {
-                Console.WriteLine($"[FUT] club item apply: id {itemPathNum} is neither an owned item nor a known catalogue id - doing nothing");
+                ServerDiagnostics.Write($"[FUT] club item apply: id {itemPathNum} is neither an owned item nor a known catalogue id - doing nothing");
                 return ("application/json; charset=utf-8",
                     "{\"success\":false,\"resourceId\":" + itemPathNum + ",\"itemData\":[]}");
             }
             string equipType = equip.Type;
+            ManagerTasks.Observe(equipType);
             long equipRes = equip.ResourceId;
             if (equipType == "ball")
-                Console.WriteLine($"[FUT] BALL RESOLVE source={equipSource} itemId={equip.ItemId} resourceId={equipRes} assetId={equip.AssetId}");
+                ServerDiagnostics.Write($"[FUT] BALL RESOLVE source={equipSource} itemId={equip.ItemId} resourceId={equipRes} assetId={equip.AssetId}");
             ClubStore.Mutate(d =>
             {
                 if (!d.Cosmetics.Any(c => c.ResourceId == equipRes && string.Equals(c.Type, equipType, StringComparison.OrdinalIgnoreCase)))
@@ -1306,10 +1346,10 @@ internal sealed class WebServer
             }
             long enow = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             var equipped = FutProfileStore.Get().Club;
-            Console.WriteLine($"[FUT] ACTIVE CLUB ITEMS LOADED: badge={equipped.ActiveBadgeId} stadium={equipped.ActiveStadiumId} " +
+            ServerDiagnostics.Write($"[FUT] ACTIVE CLUB ITEMS LOADED: badge={equipped.ActiveBadgeId} stadium={equipped.ActiveStadiumId} " +
                 $"homeKit={equipped.ActiveHomeKitId} awayKit={equipped.ActiveAwayKitId} ball={equipped.ActiveBallId}");
-            Console.WriteLine($"[FUT] BALL ACTIVE activeBallItemId={equipped.ActiveBallId}");
-            Console.WriteLine($"[FUT] equipped {equipType} {equipRes} (source={equipSource}, slot \"{activateSlot}\")");
+            ServerDiagnostics.Write($"[FUT] BALL ACTIVE activeBallItemId={equipped.ActiveBallId}");
+            ServerDiagnostics.Write($"[FUT] equipped {equipType} {equipRes} (source={equipSource}, slot \"{activateSlot}\")");
             return ("application/json; charset=utf-8",
                 "{\"success\":true,\"resourceId\":" + equipRes + ",\"itemData\":[" +
                 ClubItems.BuildJson(equip, enow, ClubItems.ActiveStateName(equipType, activateSlot)) + "]}");
@@ -1317,59 +1357,76 @@ internal sealed class WebServer
 
         if (path.Contains("/delete/") && path.EndsWith("/item") && req.HttpMethod == "POST")
         {
-            var sold = new List<long>();
-            try
+            var requested = new HashSet<long>();
+            using (var doc = System.Text.Json.JsonDocument.Parse(req.Body))
             {
-                using var doc = System.Text.Json.JsonDocument.Parse(req.Body);
                 var root = doc.RootElement;
+                void AddId(System.Text.Json.JsonElement value)
+                {
+                    if (value.ValueKind != System.Text.Json.JsonValueKind.Number || !value.TryGetInt64(out long id) || id <= 0)
+                        throw new BadHttpRequestException("Invalid item identity.", 400);
+                    if (requested.Count >= 2000) throw new BadHttpRequestException("Too many items.", 400);
+                    requested.Add(id);
+                }
                 if (root.TryGetProperty("itemId", out var itemId))
                 {
                     if (itemId.ValueKind == System.Text.Json.JsonValueKind.Array)
-                        foreach (var el in itemId.EnumerateArray())
-                            if (el.ValueKind == System.Text.Json.JsonValueKind.Number) sold.Add(el.GetInt64());
-                    else if (itemId.ValueKind == System.Text.Json.JsonValueKind.Number)
-                        sold.Add(itemId.GetInt64());
+                    {
+                        foreach (var el in itemId.EnumerateArray()) AddId(el);
+                    }
+                    else AddId(itemId);
                 }
                 else if (root.TryGetProperty("itemIds", out var itemIds)
                          && itemIds.ValueKind == System.Text.Json.JsonValueKind.Array)
                 {
-                    foreach (var el in itemIds.EnumerateArray())
-                        if (el.ValueKind == System.Text.Json.JsonValueKind.Number) sold.Add(el.GetInt64());
+                    foreach (var el in itemIds.EnumerateArray()) AddId(el);
                 }
                 else if (root.TryGetProperty("itemData", out var itemData)
                          && itemData.ValueKind == System.Text.Json.JsonValueKind.Array)
                 {
                     foreach (var item in itemData.EnumerateArray())
-                        if (item.TryGetProperty("id", out var id)
-                            && id.ValueKind == System.Text.Json.JsonValueKind.Number)
-                            sold.Add(id.GetInt64());
+                        if (item.ValueKind == System.Text.Json.JsonValueKind.Object && item.TryGetProperty("id", out var id)) AddId(id);
+                        else throw new BadHttpRequestException("Missing item identity.", 400);
                 }
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning("[FUT] discard body parse failed: {0}", ex.Message);
+                else throw new BadHttpRequestException("Missing item identities.", 400);
             }
 
             long earned = 0;
+            var sold = new List<long>();
             ClubStore.Mutate(data =>
             {
-                foreach (long id in sold)
+                foreach (long id in requested)
                 {
+                    if (data.Listings.TryGetValue(id, out var listing) && listing.State is "active" or "sold") continue;
                     int idx = data.Inventory.FindIndex(c => c.ItemId == id);
-                    if (idx < 0) continue;
-                    earned += data.Inventory[idx].Player.Rating * 4;
-                    data.Inventory.RemoveAt(idx);
-                    data.Listings.Remove(id);   // sold from inventory -> drop any listing
+                    if (idx >= 0)
+                    {
+                        earned += data.Inventory[idx].Player.Rating * 4;
+                        data.Inventory.RemoveAt(idx); data.PlayerMods.Remove(id);
+                        foreach (var squad in data.Squads) foreach (int slot in squad.Slots.Where(p => p.Value == id).Select(p => p.Key).ToArray()) squad.Slots.Remove(slot);
+                    }
+                    else if ((idx = data.ManagerItemIds.IndexOf(id)) >= 0)
+                    {
+                        earned += data.Managers[idx].Rating * 4;
+                        data.Managers.RemoveAt(idx); data.ManagerItemIds.RemoveAt(idx);
+                        foreach (var squad in data.Squads.Where(s => s.ManagerId == id)) squad.ManagerId = 0;
+                    }
+                    else if ((idx = data.StaffItemIds.IndexOf(id)) >= 0)
+                    { earned += data.Staff[idx].Rating * 4; data.Staff.RemoveAt(idx); data.StaffItemIds.RemoveAt(idx); }
+                    else if ((idx = data.Consumables.FindIndex(c => c.ItemId == id)) >= 0) data.Consumables.RemoveAt(idx);
+                    else if ((idx = data.Cosmetics.FindIndex(c => c.ItemId == id)) >= 0)
+                    { earned += data.Cosmetics[idx].Rating; data.Cosmetics.RemoveAt(idx); }
+                    else continue;
+                    sold.Add(id); data.Listings.Remove(id);
                 }
-                data.Consumables.RemoveAll(c => sold.Contains(c.ItemId));
-                data.Cosmetics.RemoveAll(c => sold.Contains(c.ItemId));
             });
             long balance = 0;
-            FutProfileStore.Mutate(p => { p.Coins += earned; balance = p.Coins; });
+            FutProfileStore.Mutate(p => { checked { p.Coins += earned; } balance = p.Coins; });
+            var removed = sold.ToHashSet();
             lock (_pendingLock)
             {
-                _pendingPackItems.RemoveAll(p => sold.Contains(p.Id));
-                _pendingDuplicates.RemoveAll(d => sold.Contains(d.NewId));
+                _pendingPackItems.RemoveAll(p => removed.Contains(p.Id));
+                _pendingDuplicates.RemoveAll(d => removed.Contains(d.NewId));
             }
             _log.LogInformation("[FUT] quick sold {0} item(s) for {1} coins; balance {2}",
                 sold.Count, earned, balance);
@@ -1417,27 +1474,19 @@ internal sealed class WebServer
                     written++;
                     continue;
                 }
-                if (wid >= ManagerItemIdBase && wid < StaffItemIdBase)
+                int managerAt = clubData.ManagerItemIds.IndexOf(wid);
+                if (managerAt >= 0)
                 {
-                    int mi = (int)(wid - ManagerItemIdBase);
-                    if (mi >= 0 && mi < clubData.Managers.Count)
-                    {
-                        if (written > 0) itemSb.Append(',');
-                        itemSb.Append(BuildManagerItem(clubData.Managers[mi], wid, itemNow, 6));
-                        written++;
-                        continue;
-                    }
+                    if (written++ > 0) itemSb.Append(',');
+                    itemSb.Append(BuildManagerItem(clubData.Managers[managerAt], wid, itemNow, 6));
+                    continue;
                 }
-                else if (wid >= StaffItemIdBase && wid < StaffItemIdBase + 10_000)
+                int staffAt = clubData.StaffItemIds.IndexOf(wid);
+                if (staffAt >= 0)
                 {
-                    int si = (int)(wid - StaffItemIdBase);
-                    if (si >= 0 && si < clubData.Staff.Count)
-                    {
-                        if (written > 0) itemSb.Append(',');
-                        itemSb.Append(BuildStaffItem(clubData.Staff[si], wid, itemNow, 6));
-                        written++;
-                        continue;
-                    }
+                    if (written++ > 0) itemSb.Append(',');
+                    itemSb.Append(BuildStaffItem(clubData.Staff[staffAt], wid, itemNow, 6));
+                    continue;
                 }
                 if (ItemIds.TryResolve(wid, out RealPlayer player))
                 {
@@ -1496,6 +1545,7 @@ internal sealed class WebServer
                         int want = pileName switch { "club" => 6, "trade" => 3, _ => 0 };
                         if (want == 0) continue;
                         int idx = data.Inventory.FindIndex(c => c.ItemId == id);
+                        if (data.Listings.TryGetValue(id, out var listing) && listing.State is "sold" or "active") continue;
                         if (idx >= 0 && data.Inventory[idx].Pile != want)
                             data.Inventory[idx] = new ClubItem(id, data.Inventory[idx].Player, want);
                         if (want != 3) data.Listings.Remove(id);   // left the transfer list -> drop any listing
@@ -1506,6 +1556,7 @@ internal sealed class WebServer
                 {
                     var claimedIds = new HashSet<long>(moves.Select(m => m.Id));
                     _pendingPackItems.RemoveAll(p => claimedIds.Contains(p.Id));
+                    _pendingDuplicates.RemoveAll(d => claimedIds.Contains(d.NewId));
                     left = _pendingPackItems.Count;
                 }
                 _log.LogInformation("[FUT] claimed {0} item(s) -> {1}; {2} left to deal with",
@@ -1534,16 +1585,22 @@ internal sealed class WebServer
                 var packIdMatch = System.Text.RegularExpressions.Regex.Match(req.Body, "\"packId\"\\s*:\\s*(\\d+)");
                 if (packIdMatch.Success) int.TryParse(packIdMatch.Groups[1].Value, out packId);
 
-                int packPrice = StorePacks.FirstOrDefault(p => p.Id == packId).Coins;
+                var storePack = StorePacks.FirstOrDefault(p => p.Id == packId);
+                if (storePack.Id == 0 || !PackConfig.Packs.ContainsKey(packId)) throw new BadHttpRequestException("Unknown store pack.", 400);
+                int packPrice = storePack.Coins;
+                if (FutProfileStore.Get().Coins < packPrice)
+                    return ("application/json; charset=utf-8", "{\"reason\":\"INSUFFICIENT_COINS\",\"itemList\":[],\"numberItems\":0}");
                 long coinsAfter = 0;
                 FutProfileStore.Mutate(p =>
                 {
-                    p.Coins = Math.Max(0, p.Coins - packPrice);
+                    p.Coins -= packPrice;
                     coinsAfter = p.Coins;
                 });
                 _log.LogInformation("[FUT] pack {0} opened for {1} coins; balance {2}", packId, packPrice, coinsAfter);
 
                 var picks = PackEngine.Open(packId, rnd, out _);
+                var clubCapacity = ClubStore.Get();
+                if (clubCapacity.Inventory.Count + clubCapacity.Consumables.Count + clubCapacity.Cosmetics.Count + clubCapacity.Managers.Count + clubCapacity.Staff.Count + picks.Count > 2000) throw new BadHttpRequestException("Club capacity exceeded.", 409);
 
                 var drawn = new List<(long Id, string Json)>();
                 var dupes = new List<(long NewId, long OwnedId)>();
@@ -1574,7 +1631,7 @@ internal sealed class WebServer
                             }
                             case PackPick.ItemKind.Consumable:
                             {
-                                long id = Interlocked.Increment(ref _nextPackExtraId);
+                                long id = ++_nextPackExtraId;
                                 var inst = pick.Consumable with { ItemId = id };
                                 drawn.Add((id, ConsumableItems.BuildJson(inst, nowUnix)));
                                 data.Consumables.Add(inst);
@@ -1582,7 +1639,7 @@ internal sealed class WebServer
                             }
                             case PackPick.ItemKind.Cosmetic:
                             {
-                                long id = Interlocked.Increment(ref _nextPackExtraId);
+                                long id = ++_nextPackExtraId;
                                 var inst = pick.Cosmetic with { ItemId = id };
                                 drawn.Add((id, ClubItems.BuildJson(inst, nowUnix)));
                                 data.Cosmetics.Add(inst);
@@ -1590,16 +1647,18 @@ internal sealed class WebServer
                             }
                             case PackPick.ItemKind.Manager:
                             {
-                                long id = Interlocked.Increment(ref _nextPackExtraId);
+                                long id = ++_nextPackExtraId;
                                 drawn.Add((id, BuildManagerItem(pick.Manager, id, nowUnix, 6, pick.ManagerRareFlag)));
                                 data.Managers.Add(pick.Manager);
+                                data.ManagerItemIds.Add(id);
                                 break;
                             }
                             case PackPick.ItemKind.Staff:
                             {
-                                long id = Interlocked.Increment(ref _nextPackExtraId);
+                                long id = ++_nextPackExtraId;
                                 drawn.Add((id, BuildStaffItem(pick.Staff, id, nowUnix, 6)));
                                 data.Staff.Add(pick.Staff);
+                                data.StaffItemIds.Add(id);
                                 break;
                             }
                         }
@@ -1620,9 +1679,7 @@ internal sealed class WebServer
                 _lastPackItemList = items.ToString();
                 lock (_pendingLock)
                 {
-                    _pendingPackItems.Clear();
                     _pendingPackItems.AddRange(drawn);
-                    _pendingDuplicates.Clear();
                     _pendingDuplicates.AddRange(dupes);
                 }
                 if (dupes.Count > 0)
@@ -1635,6 +1692,7 @@ internal sealed class WebServer
                     "\"entitlementQuantities\":null,\"awardSetIds\":[]" +
                     ",\"coins\":" + coinsAfter + ",\"credits\":" + coinsAfter +
                     ",\"currencies\":" + CurrenciesJson(coinsAfter) + "}";
+                ManagerTasks.Observe("open_pack");
                 _lastPurchaseResponseBody = purchasedBody;
                 return ("application/json; charset=utf-8", purchasedBody);
             }
@@ -1670,29 +1728,17 @@ internal sealed class WebServer
         if (path.EndsWith("/squad") && req.HttpMethod == "POST")
         {
             Squad created = null;
+            using var document = System.Text.Json.JsonDocument.Parse(req.Body);
             ClubStore.Mutate(data =>
             {
-                int newId = data.Squads.Count > 0 ? data.Squads.Max(s => s.Id) + 1 : 0;
-                string name = null, formation = null;
-                try
-                {
-                    using var doc = System.Text.Json.JsonDocument.Parse(req.Body);
-                    var root = doc.RootElement;
-                    if (root.TryGetProperty("id", out var idEl) && idEl.ValueKind == System.Text.Json.JsonValueKind.Number
-                        && idEl.TryGetInt32(out int wantId) && wantId >= 0 && data.Squads.All(s => s.Id != wantId))
-                        newId = wantId;
-                    if (root.TryGetProperty("squadName", out var nEl) && nEl.ValueKind == System.Text.Json.JsonValueKind.String)
-                        name = nEl.GetString();
-                    if (root.TryGetProperty("formation", out var fEl) && fEl.ValueKind == System.Text.Json.JsonValueKind.String)
-                        formation = fEl.GetString();
-                }
-                catch (Exception ex) { _log.LogWarning("Squad POST body parse failed: {0}", ex.Message); }
-
+                if (data.Squads.Count >= 30) throw new BadHttpRequestException("Squad capacity exceeded.", 409);
+                int newId = data.Squads.Count > 0 ? checked(data.Squads.Max(s => s.Id) + 1) : 0;
                 created = new Squad { Id = newId };
-                if (!string.IsNullOrWhiteSpace(name)) created.Name = name;
-                if (!string.IsNullOrWhiteSpace(formation)) created.Formation = formation;
+                SquadEditor.Apply(data, created, document.RootElement);
                 data.Squads.Add(created);
+                SquadEditor.ReconcilePiles(data);
             });
+            ManagerTasks.Observe("create_squad");
             return ("application/json; charset=utf-8", BuildFullSquadJson(created));
         }
 
@@ -1702,82 +1748,15 @@ internal sealed class WebServer
             Squad target = null;
             ClubStore.Mutate(data =>
             {
-                if (data.Inventory.Count == 0) return;
-
                 target = data.Squads.FirstOrDefault(s => s.Id == putId);
-                try
-                {
-                    using var doc = System.Text.Json.JsonDocument.Parse(req.Body);
-                    var root = doc.RootElement;
-                    if (root.TryGetProperty("players", out var probe) && probe.ValueKind == System.Text.Json.JsonValueKind.Array
-                        && probe.GetArrayLength() > 0)
-                    {
-                        bool anyOwned = false;
-                        foreach (var pl in probe.EnumerateArray())
-                        {
-                            if (!pl.TryGetProperty("itemData", out var it)) continue;
-                            if (!it.TryGetProperty("id", out var idp)) continue;
-                            long sid = idp.GetInt64();
-                            if (sid != 0 && data.Inventory.Any(c => c.ItemId == sid)) { anyOwned = true; break; }
-                        }
-                        if (!anyOwned) return;
-                    }
-
-                    if (target == null)
-                    {
-                        target = new Squad { Id = putId };
-                        data.Squads.Add(target);
-                    }
-
-                    if (root.TryGetProperty("squadName", out var nameEl) && nameEl.ValueKind == System.Text.Json.JsonValueKind.String)
-                        target.Name = nameEl.GetString() ?? target.Name;
-                    if (root.TryGetProperty("formation", out var formEl) && formEl.ValueKind == System.Text.Json.JsonValueKind.String)
-                        target.Formation = formEl.GetString() ?? target.Formation;
-                    if (root.TryGetProperty("chemistry", out var chemEl) && chemEl.ValueKind == System.Text.Json.JsonValueKind.Number)
-                        target.Chemistry = chemEl.GetInt32();
-                    if (root.TryGetProperty("starRating", out var starEl) && starEl.ValueKind == System.Text.Json.JsonValueKind.Number)
-                        target.StarRating = starEl.GetInt32();
-                    if (root.TryGetProperty("players", out var playersEl) && playersEl.ValueKind == System.Text.Json.JsonValueKind.Array)
-                    {
-                        var newSlots = new Dictionary<int, long>();
-                        foreach (var pl in playersEl.EnumerateArray())
-                        {
-                            if (!pl.TryGetProperty("index", out var idxEl)) continue;
-                            if (!pl.TryGetProperty("itemData", out var itemDataEl)) continue;
-                            if (!itemDataEl.TryGetProperty("id", out var idEl)) continue;
-                            long slotItemId = idEl.GetInt64();
-                            if (slotItemId != 0 && data.Inventory.Any(c => c.ItemId == slotItemId))
-                                newSlots[idxEl.GetInt32()] = slotItemId;
-                        }
-                        if (newSlots.Count > 0)
-                        {
-                            int had = target.Slots.Count(s => s.Value != 0);
-                            if (newSlots.Count < had)
-                                _log.LogWarning("[FUT] squad PUT {0} shrinks the squad: {1} slot(s) in, {2} saved - the client dropped entries from our last squad body",
-                                    putId, newSlots.Count, had);
-                            else
-                                _log.LogInformation("[FUT] squad PUT {0}: {1} slot(s) (was {2})", putId, newSlots.Count, had);
-
-                            target.Slots.Clear();
-                            foreach (var kv in newSlots) target.Slots[kv.Key] = kv.Value;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _log.LogWarning("Squad PUT body parse failed: {0}", ex.Message);
-                }
-
-                var assigned = new HashSet<long>(data.Squads.SelectMany(s => s.Slots.Values).Where(v => v != 0));
-                for (int i = 0; i < data.Inventory.Count; i++)
-                {
-                    if (data.Inventory[i].Pile is 3 or 0) continue;   // leave transfer-list/unassigned items alone
-                    int want = assigned.Contains(data.Inventory[i].ItemId) ? 7 : 6;
-                    if (data.Inventory[i].Pile != want)
-                        data.Inventory[i] = new ClubItem(data.Inventory[i].ItemId, data.Inventory[i].Player, want);
-                }
+                if (target == null) throw new BadHttpRequestException("Squad does not exist.", 404);
+                using var document = System.Text.Json.JsonDocument.Parse(req.Body);
+                SquadEditor.Apply(data, target, document.RootElement);
+                SquadEditor.ReconcilePiles(data);
                 if (target != null && target.Slots.Count > 0) data.ActiveSquadId = putId;
             });
+            if (target != null && req.Body.Contains("squadName")) ManagerTasks.Observe("rename_squad");
+            if (target != null && req.Body.Contains("formation")) ManagerTasks.Observe("formation");
             target ??= new Squad { Id = putId };   // nothing owned/persisted: respond with an empty squad
             return ("application/json; charset=utf-8", BuildFullSquadJson(target));
         }
@@ -1860,7 +1839,7 @@ internal sealed class WebServer
                     if (ab.Success) p.Club.Abbr = ab.Groups[1].Value;
                 });
                 _log.LogInformation("[FUT] club established: '{0}'", FutProfileStore.Get().Club.Name);
-                if (firstTime) ClubStore.SeedStarterSquad();   // grant the bronze starter squad once
+                if (firstTime) { ClubStore.SeedStarterSquad(); ManagerTasks.Observe("create_club"); }   // grant the bronze starter squad once
             }
 
             var prof = FutProfileStore.Get();
@@ -1888,7 +1867,7 @@ internal sealed class WebServer
         var full = Path.Combine(_contentRoot, fileName);
         try
         {
-            return (contentType, File.ReadAllText(full));
+            return (contentType, Encoding.UTF8.GetString(_staticFiles[Path.GetFullPath(full)].Bytes));
         }
         catch (Exception ex)
         {
@@ -2000,7 +1979,7 @@ internal sealed class WebServer
     private static int PackRareCount(int packId, int playerRare) =>
         playerRare + (PackExtras.TryGetValue(packId, out var e) ? e.RareExtras : 0);
 
-    private static long _nextPackExtraId = 970_000_000L;
+    private static long _nextPackExtraId { get => PlayerContext.Current.Data.NextPackExtraId; set => PlayerContext.Current.Data.NextPackExtraId = value; }
 
 
     private static bool OwnedInClub(ClubData data, long itemId)
@@ -2029,7 +2008,7 @@ internal sealed class WebServer
 
     private static string BodyRx(string s, string pattern)
     {
-        var m = System.Text.RegularExpressions.Regex.Match(s ?? "", pattern);
+        var m = System.Text.RegularExpressions.Regex.Match(s ?? "", pattern, System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
         return m.Success ? m.Groups[1].Value : "";
     }
 
@@ -2049,9 +2028,15 @@ internal sealed class WebServer
     {
         FutProfileStore.Reset();
         ClubStore.Wipe();
-        Market.MyBids.Clear();
+        PlayerContext.Current.Data.Market = new();
+        PlayerContext.Current.Data.PendingPackItems.Clear();
+        PlayerContext.Current.Data.PendingDuplicates.Clear();
+        PlayerContext.Current.Data.ManagerTasks.Clear();
+        PlayerContext.Current.Data.NativeManagerQuest = new int[3];
+        PlayerContext.Current.Data.ManagerCompletionClaimed = false;
+        PlayerContext.Current.Data.Match = null;
         ClientDataStore.Clear();
-        Tournaments.CurrentMatchTournamentId = null;
+        PlayerContext.Current.Data.LastCompetition = "";
         _log.LogInformation("[FUT] club deleted -> account reset to new player");
     }
 
@@ -2068,7 +2053,7 @@ internal sealed class WebServer
             ",\"platform\":\"pc\",\"assetId\":" + prof.Club.BadgeId + ",\"badgeId\":" + prof.Club.BadgeId +
             ",\"seasonId\":1,\"status\":" + est + ",\"established\":\"" + prof.Club.EstablishedAt + "\",\"divisionOnline\":" + prof.OnlineDivision +
             ",\"divisionOffline\":" + prof.OfflineDivision + ",\"lastAccessTime\":1400000000," +
-            "\"skuAccessList\":{\"" + Sku + "\":1,\"FFA14PS3\":1,\"FFA14XBX\":1}}";
+            "\"skuAccessList\":{\"" + Sku + "\":1}}";
         string clubListEntries = prof.Club.Established ? clubList : "";
         string persona =
             "{\"personaId\":" + nucleusId + ",\"personaName\":\"" + BlazePersonaName + "\"," +
@@ -2138,10 +2123,10 @@ internal sealed class WebServer
         if (team >= 0) preds.Add(p => p.TeamId == team);
 
         int maskedDefId = Int("maskedDefId", -1);
-        if (maskedDefId > 0) preds.Add(p => p.Id == maskedDefId);
+        if (maskedDefId > 0) preds.Add(p => p.Id == maskedDefId % SpecialCards.Band);
 
         int defId = Int("definitionId", -1);
-        if (defId > 0) preds.Add(p => p.Id == defId);
+        if (defId > 0) preds.Add(p => p.CardId == defId);
 
 
         string lev = (q["lev"] ?? "").ToLowerInvariant();
@@ -2175,6 +2160,8 @@ internal sealed class WebServer
     private (string, string) MarketBuy(long tradeId, int amount, long offeredItemId = 0)
     {
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (ClubStore.Get().Inventory.Count + ClubStore.Get().Consumables.Count + ClubStore.Get().Cosmetics.Count + ClubStore.Get().Managers.Count + ClubStore.Get().Staff.Count >= 2000) throw new BadHttpRequestException("Club capacity exceeded.", 409);
+        if (Market.MyBids.Count >= 100 && !Market.MyBids.ContainsKey(tradeId)) throw new BadHttpRequestException("Bid capacity exceeded.", 409);
         if (tradeId >= Market.StaffTradeIdBase)
             return StaffBuy(tradeId, amount);
         if (tradeId >= Market.ClubItemTradeIdBase)
@@ -2186,11 +2173,15 @@ internal sealed class WebServer
 
         long coins = FutProfileStore.Get().Coins;
         if (amount <= 0) amount = buyNow;
+        long previousBid = Market.MyBids.GetValueOrDefault(tradeId);
+        var currentAuction = Market.AuctionState(tradeId, now);
+        if (amount < buyNow && (amount < startingBid || amount < previousBid || (currentAuction.CurrentBid > previousBid && amount < currentAuction.CurrentBid + Market.Step(currentAuction.CurrentBid))))
+            return ("application/json; charset=utf-8", "{\"reason\":\"BID_TOO_LOW\",\"auctionInfo\":[]}");
         long escrowed = Market.EscrowHeld(tradeId);   // coins we already hold for this trade
         bool won = amount >= buyNow;
         long extraCharge = won ? Math.Max(0, (long)buyNow - escrowed)
                                : Math.Max(0, (long)amount - escrowed);
-        long available = coins - Market.HeldCoins;    // profile minus coins committed elsewhere
+        long available = coins;    // profile minus coins committed elsewhere
         if (extraCharge > available)
             return ("application/json; charset=utf-8",
                 "{\"reason\":\"INSUFFICIENT_COINS\",\"tradeId\":" + tradeId + ",\"credits\":" + available +
@@ -2242,8 +2233,8 @@ internal sealed class WebServer
                     tradeId, amount, offeredCard.Value.Player.Name, cardValue, buyNow, acceptIn);
                 return ("application/json; charset=utf-8",
                     "{\"auctionInfo\":[" + offerAuc + "],\"errorState\":null,\"duplicateItemIdList\":[]," +
-                    "\"credits\":" + (coins - Market.HeldCoins) + ",\"totalCredits\":" + (coins - Market.HeldCoins) + ",\"coins\":" + (coins - Market.HeldCoins) +
-                    ",\"currencies\":" + CurrenciesJson(coins - Market.HeldCoins) + ",\"bidTokens\":{}}");
+                    "\"credits\":" + (coins) + ",\"totalCredits\":" + (coins) + ",\"coins\":" + (coins) +
+                    ",\"currencies\":" + CurrenciesJson(coins) + ",\"bidTokens\":{}}");
             }
             else
             {
@@ -2293,6 +2284,7 @@ internal sealed class WebServer
                 _pendingPackItems.Add((itemId, item));
                 _pendingDuplicates.AddRange(dupes);
             }
+            ManagerTasks.Observe("buy_player");
             _lastPackItemList = "[" + item + "]";
             Market.Watched.TryRemove(tradeId, out _);
             Market.MyBids.TryRemove(tradeId, out _);
@@ -2304,8 +2296,8 @@ internal sealed class WebServer
         {
             if (Market.Bought(tradeId, now))   // already sold to someone else this cycle
                 return ("application/json; charset=utf-8",
-                    "{\"reason\":\"INVALID_REQUEST\",\"tradeId\":" + tradeId + ",\"credits\":" + (coins - Market.HeldCoins) +
-                    ",\"currencies\":" + CurrenciesJson(coins - Market.HeldCoins) + ",\"bidTokens\":{}}");
+                    "{\"reason\":\"INVALID_REQUEST\",\"tradeId\":" + tradeId + ",\"credits\":" + (coins) +
+                    ",\"currencies\":" + CurrenciesJson(coins) + ",\"bidTokens\":{}}");
             if (amount > escrowed)
             {
                 FutProfileStore.Mutate(p => p.Coins -= (amount - escrowed));
@@ -2317,6 +2309,7 @@ internal sealed class WebServer
                 Market.ChangeHeld(-(escrowed - amount));
             }
             coins = coins - Math.Max(0, amount - escrowed) + Math.Max(0, escrowed - amount);
+            PlayerContext.Current.Data.Market.BidTimings[tradeId] = Market.Timing(tradeId, now);
             Market.MyBids[tradeId] = amount;   // user's bid becomes the listing's current price
             _log.LogInformation("[Market] BID {0} on asset {1} (rating {2}) - buy-now to purchase now",
                 amount, card.Id, card.Rating);
@@ -2334,8 +2327,8 @@ internal sealed class WebServer
             "\"sellerEstablished\":2013,\"sellerId\":1,\"confidenceValue\":100}";
         return ("application/json; charset=utf-8",
             "{\"auctionInfo\":[" + auction + "],\"errorState\":null,\"duplicateItemIdList\":" + DuplicateListJson(dupes) + "," +
-            "\"credits\":" + (coins - Market.HeldCoins) + ",\"totalCredits\":" + (coins - Market.HeldCoins) + ",\"coins\":" + (coins - Market.HeldCoins) +
-            ",\"currencies\":" + CurrenciesJson(coins - Market.HeldCoins) + ",\"bidTokens\":{}}");
+            "\"credits\":" + (coins) + ",\"totalCredits\":" + (coins) + ",\"coins\":" + (coins) +
+            ",\"currencies\":" + CurrenciesJson(coins) + ",\"bidTokens\":{}}");
     }
 
     private (string, string) ConsumableBuy(long tradeId, int amount)
@@ -2363,7 +2356,7 @@ internal sealed class WebServer
             var owned = new Dictionary<long, long>();
             foreach (var c in d.Consumables)
                 if (!owned.ContainsKey(c.ResourceId)) owned[c.ResourceId] = c.ItemId;
-            itemId = Interlocked.Increment(ref _nextPackExtraId);
+            itemId = ++_nextPackExtraId;
             var inst = item with { ItemId = itemId };
             if (owned.TryGetValue(inst.ResourceId, out long ownedId)) dupes.Add((itemId, ownedId));
             d.Consumables.Add(inst);
@@ -2386,8 +2379,8 @@ internal sealed class WebServer
             ",\"sellerName\":\"" + seller + "\",\"sellerEstablished\":2013,\"sellerId\":1,\"confidenceValue\":100}";
         return ("application/json; charset=utf-8",
             "{\"auctionInfo\":[" + auction + "],\"errorState\":null,\"duplicateItemIdList\":" + DuplicateListJson(dupes) + "," +
-            "\"credits\":" + (coins - Market.HeldCoins) + ",\"totalCredits\":" + (coins - Market.HeldCoins) + ",\"coins\":" + (coins - Market.HeldCoins) +
-            ",\"currencies\":" + CurrenciesJson(coins - Market.HeldCoins) + ",\"bidTokens\":{}}");
+            "\"credits\":" + (coins) + ",\"totalCredits\":" + (coins) + ",\"coins\":" + (coins) +
+            ",\"currencies\":" + CurrenciesJson(coins) + ",\"bidTokens\":{}}");
     }
 
     private (string, string) ClubItemBuy(long tradeId, int amount)
@@ -2415,7 +2408,7 @@ internal sealed class WebServer
             var owned = new Dictionary<(string, long), long>();
             foreach (var c in d.Cosmetics)
                 if (!owned.ContainsKey((c.Type, c.ResourceId))) owned[(c.Type, c.ResourceId)] = c.ItemId;
-            itemId = Interlocked.Increment(ref _nextPackExtraId);
+            itemId = ++_nextPackExtraId;
             var inst = item with { ItemId = itemId };
             if (owned.TryGetValue((inst.Type, inst.ResourceId), out long ownedId)) dupes.Add((itemId, ownedId));
             d.Cosmetics.Add(inst);
@@ -2438,8 +2431,8 @@ internal sealed class WebServer
             ",\"sellerName\":\"" + seller + "\",\"sellerEstablished\":2013,\"sellerId\":1,\"confidenceValue\":100}";
         return ("application/json; charset=utf-8",
             "{\"auctionInfo\":[" + auction + "],\"errorState\":null,\"duplicateItemIdList\":" + DuplicateListJson(dupes) + "," +
-            "\"credits\":" + (coins - Market.HeldCoins) + ",\"totalCredits\":" + (coins - Market.HeldCoins) + ",\"coins\":" + (coins - Market.HeldCoins) +
-            ",\"currencies\":" + CurrenciesJson(coins - Market.HeldCoins) + ",\"bidTokens\":{}}");
+            "\"credits\":" + (coins) + ",\"totalCredits\":" + (coins) + ",\"coins\":" + (coins) +
+            ",\"currencies\":" + CurrenciesJson(coins) + ",\"bidTokens\":{}}");
     }
 
     private (string, string) StaffBuy(long tradeId, int amount)
@@ -2466,18 +2459,20 @@ internal sealed class WebServer
         string itemJson = "";
         ClubStore.Mutate(d =>
         {
-            itemId = Interlocked.Increment(ref _nextPackExtraId);
+            itemId = ++_nextPackExtraId;
             if (isManager)
             {
                 int idx = d.Managers.FindIndex(m => m.ResourceId == mgr.ResourceId);
-                if (idx >= 0) dupes.Add((itemId, ManagerItemIdBase + idx));
+                if (idx >= 0) dupes.Add((itemId, d.ManagerItemIds[idx]));
                 d.Managers.Add(mgr);
+                d.ManagerItemIds.Add(itemId);
             }
             else
             {
                 int idx = d.Staff.FindIndex(s => s.ResourceId == stf.ResourceId);
-                if (idx >= 0) dupes.Add((itemId, StaffItemIdBase + idx));
+                if (idx >= 0) dupes.Add((itemId, d.StaffItemIds[idx]));
                 d.Staff.Add(stf);
+                d.StaffItemIds.Add(itemId);
             }
         });
         if (isManager)
@@ -2507,8 +2502,8 @@ internal sealed class WebServer
             ",\"sellerName\":\"" + seller + "\",\"sellerEstablished\":2013,\"sellerId\":1,\"confidenceValue\":100}";
         return ("application/json; charset=utf-8",
             "{\"auctionInfo\":[" + auction + "],\"errorState\":null,\"duplicateItemIdList\":" + DuplicateListJson(dupes) + "," +
-            "\"credits\":" + (coins - Market.HeldCoins) + ",\"totalCredits\":" + (coins - Market.HeldCoins) + ",\"coins\":" + (coins - Market.HeldCoins) +
-            ",\"currencies\":" + CurrenciesJson(coins - Market.HeldCoins) + ",\"bidTokens\":{}}");
+            "\"credits\":" + (coins) + ",\"totalCredits\":" + (coins) + ",\"coins\":" + (coins) +
+            ",\"currencies\":" + CurrenciesJson(coins) + ",\"bidTokens\":{}}");
     }
 
     private void SettleWonBids(long now)
@@ -2531,8 +2526,12 @@ internal sealed class WebServer
                     r.MyBid, r.TradeId, r.Card.Name, esc);
                 continue;
             }
-            if (esc <= 0)   // pre-escrow bids still pay on win; escrowed bids already paid
-                FutProfileStore.Mutate(p => p.Coins = Math.Max(0, p.Coins - r.MyBid));
+            if (esc <= 0)
+            {
+                if (FutProfileStore.Get().Coins < r.MyBid) continue;
+                FutProfileStore.Mutate(p => p.Coins -= r.MyBid);
+            }
+            else Market.ChangeHeld(-esc);
             long itemId = 0;
             var winDupes = new List<(long NewId, long OwnedId)>();
             ClubStore.Mutate(d =>
@@ -2841,7 +2840,7 @@ internal sealed class WebServer
             "\"marketDataMinPrice\":150,\"marketDataMaxPrice\":15000000,\"attributeList\":" + attrList +
             ",\"teamid\":" + player.TeamId + ",\"rareflag\":" + rareflag + ",\"playStyle\":" + playStyle + "," +
             "\"playstyle\":" + playStyle + "," +
-            "\"leagueId\":1,\"assists\":0,\"lifetimeAssists\":0," +
+            "\"leagueId\":" + TeamLeagues.LeagueOf(player.TeamId) + ",\"assists\":0,\"lifetimeAssists\":0," +
             "\"loyaltyBonus\":1,\"pile\":" + pile + ",\"loans\":0,\"nation\":" + player.NationId +
             ",\"resourceGameYear\":2014,\"amount\":0}";
     }
@@ -2876,7 +2875,7 @@ internal sealed class WebServer
         var c = ConsumableItems.Catalog.FirstOrDefault(x => x.ResourceId == resourceId);
         if (c.ResourceId != resourceId)
         {
-            Console.WriteLine($"[FUT] apply consumable: unknown resourceId {resourceId}");
+            ServerDiagnostics.Write($"[FUT] apply consumable: unknown resourceId {resourceId}");
             return changed;
         }
         ConsumableItems.Effects.TryGetValue(resourceId, out var def);
@@ -2901,7 +2900,8 @@ internal sealed class WebServer
                 changed.Add(tid);
             }
         });
-        Console.WriteLine($"[FUT] applied consumable {resourceId} ({def.Category}/{def.Kind}) to {changed.Count} player(s)");
+        if (changed.Count > 0) ManagerTasks.Observe(def.Category ?? "chemstyle");
+        ServerDiagnostics.Write($"[FUT] applied consumable {resourceId} ({def.Category}/{def.Kind}) to {changed.Count} player(s)");
         return changed;
     }
 
@@ -3071,8 +3071,9 @@ internal sealed class WebServer
 
     private static void ApplyMatchConsequences(string body)
     {
-        var xi = ActiveSquadStarterIds();
-        var bench = ActiveSquadBenchIds();
+        var match = PlayerContext.Current.Data.Match;
+        var xi = match?.StartingXiIds ?? new List<long>();
+        var bench = new List<long>();
         if (xi.Count == 0 && bench.Count == 0) return;
         var reports = ParseMatchItems(body);
         var rnd = new Random();
@@ -3132,7 +3133,7 @@ internal sealed class WebServer
                 benched++;
             }
         });
-        Console.WriteLine($"[FUT] match consequences: {played} played, {benched} subs, {injuries} injuries, {bans} bans");
+        ServerDiagnostics.Write($"[FUT] match consequences: {played} played, {benched} subs, {injuries} injuries, {bans} bans");
     }
 
     private static bool InjuryMatches(string injury, string cardKind)
@@ -3235,7 +3236,7 @@ internal sealed class WebServer
             ("balls", data.Cosmetics.Count(c => c.Type == "ball")),
             ("kits", data.Cosmetics.Count(c => c.Type == "kit")),
             ("badges", data.Cosmetics.Count(c => c.Type == "badge")),
-            ("trophies", 0),
+            ("trophies", FutProfileStore.Get().TrophiesWon),
         };
         var scalars = string.Join(",", members.Select(x => "\"" + x.Key + "\":" + x.Val));
         var statArr = "[" + string.Join(",", members.Select(x =>
@@ -3268,23 +3269,16 @@ internal sealed class WebServer
 
     private static string ManagerItemsJson(int offset, int countLimit, long now, int pile, int nationFilter = -1, int leagueFilter = -1, string levelFilter = "")
     {
-        var page = ClubStore.Get().Managers
-            .Where(m => (nationFilter == -1 || m.NationId == nationFilter)
-                && (leagueFilter == -1 || m.LeagueId == leagueFilter)
-                && levelFilter switch
-                {
-                    "bronze" => m.Rating < 65,
-                    "silver" => m.Rating is >= 65 and < 75,
-                    "gold" => m.Rating >= 75,
-                    _ => true,
-                })
+        var data = ClubStore.Get();
+        var page = data.Managers.Select((m, i) => (Manager: m, Id: data.ManagerItemIds[i]))
+            .Where(x => (nationFilter == -1 || x.Manager.NationId == nationFilter) && (leagueFilter == -1 || x.Manager.LeagueId == leagueFilter)
+                && (levelFilter switch { "bronze" => x.Manager.Rating < 65, "silver" => x.Manager.Rating is >= 65 and < 75, "gold" => x.Manager.Rating >= 75, _ => true }))
             .Skip(offset).Take(countLimit).ToArray();
         var sb = new StringBuilder("[");
         for (int i = 0; i < page.Length; i++)
         {
             if (i > 0) sb.Append(',');
-            int idx = offset + i;
-            sb.Append(BuildManagerItem(page[i], ManagerItemIdBase + idx, now, pile));
+            sb.Append(BuildManagerItem(page[i].Manager, page[i].Id, now, pile));
         }
         sb.Append(']');
         return sb.ToString();
@@ -3346,9 +3340,9 @@ internal sealed class WebServer
         if (typeFilter == null)
         {
             for (int i = 0; i < data.Managers.Count; i++)
-                all.Add(BuildManagerItem(data.Managers[i], ManagerItemIdBase + i, now, pile));
+                all.Add(BuildManagerItem(data.Managers[i], data.ManagerItemIds[i], now, pile));
             for (int i = 0; i < data.Staff.Count; i++)
-                all.Add(BuildStaffItem(data.Staff[i], StaffItemIdBase + i, now, pile));
+                all.Add(BuildStaffItem(data.Staff[i], data.StaffItemIds[i], now, pile));
         }
         else
         {
@@ -3364,14 +3358,14 @@ internal sealed class WebServer
                     _ => true,
                 };
                 if (!levelOk) continue;
-                all.Add(BuildStaffItem(s, StaffItemIdBase + i, now, pile));
+                all.Add(BuildStaffItem(s, data.StaffItemIds[i], now, pile));
             }
         }
         var page = all.Skip(offset).Take(countLimit);
         return "[" + string.Join(",", page) + "]";
     }
 
-    private static int _matchIdSeq = 1000;
+
 
     private Squad ResolveMatchSquad(string body)
     {
@@ -3430,11 +3424,11 @@ internal sealed class WebServer
 
             filled++;
             string item = BuildRealPlayerItem(rnd, player, itemId, now, 7);
-            playersSb.Append("{\"index\":" + idx + ",\"loyaltyBonus\":1,\"kitNumber\":0,\"chemistry\":10,\"itemData\":" + item + "}");
+            playersSb.Append("{\"index\":" + idx + ",\"loyaltyBonus\":1,\"kitNumber\":" + squad.KitNumbers.GetValueOrDefault(idx) + ",\"chemistry\":10,\"itemData\":" + item + "}");
             if (captainId == 0 || player.Position == "ST") captainId = itemId;
         }
         playersSb.Append(']');
-        Console.WriteLine($"[FUT] squad {squad.Id}: {filled} of {slotCount} slots filled");
+        ServerDiagnostics.Write($"[FUT] squad {squad.Id}: {filled} of {slotCount} slots filled");
         // The client computes and PUTs its own chemistry/rating/starRating, so we just
         // persist and echo those back rather than recomputing server-side.
         int rating = squad.StarRating;
@@ -3447,19 +3441,18 @@ internal sealed class WebServer
         long squadBallId = ClubItems.Catalog.FirstOrDefault(c => c.Type == "ball" && c.ResourceId == equipProf.ActiveBallId).AssetId;
         long squadHomeKitId = ClubItems.Catalog.FirstOrDefault(c => c.Type == "kit" && c.ResourceId == equipProf.ActiveHomeKitId).AssetId;
         long squadAwayKitId = ClubItems.Catalog.FirstOrDefault(c => c.Type == "kit" && c.ResourceId == equipProf.ActiveAwayKitId).AssetId;
-        Console.WriteLine($"[FUT] SQUAD ACTIVE EQUIPPABLES: stadiumId={squadStadiumId} homeKitId={squadHomeKitId} " +
+        ServerDiagnostics.Write($"[FUT] SQUAD ACTIVE EQUIPPABLES: stadiumId={squadStadiumId} homeKitId={squadHomeKitId} " +
             $"awayKitId={squadAwayKitId} ballItemId={squadBallItemId} ballId={squadBallId}");
 
-        string kicktakers = "[{\"id\":" + captainId + ",\"index\":0},{\"id\":" + captainId + ",\"index\":1}," +
-            "{\"id\":" + captainId + ",\"index\":2},{\"id\":" + captainId + ",\"index\":3}," +
-            "{\"id\":" + captainId + ",\"index\":4}]";
+        if (squad.CaptainId > 0 && squad.Slots.Values.Contains(squad.CaptainId)) captainId = squad.CaptainId;
+        string kicktakers = "[" + string.Join(",", Enumerable.Range(0, 5).Select(index => "{\"id\":" + squad.KickTakers.GetValueOrDefault(index, captainId) + ",\"index\":" + index + "}")) + "]";
 
         string squadManager = "{\"id\":0,\"itemType\":\"manager\"}";
         if (squad.ManagerId != 0)
         {
-            int mIdx = (int)(squad.ManagerId - ManagerItemIdBase);
-            if (mIdx >= 0 && mIdx < Managers.All.Length)
-                squadManager = BuildManagerItem(Managers.All[mIdx], squad.ManagerId, now, 7);
+            int mIdx = ClubStore.Get().ManagerItemIds.IndexOf(squad.ManagerId);
+            if (mIdx >= 0 && mIdx < ClubStore.Get().Managers.Count)
+                squadManager = BuildManagerItem(ClubStore.Get().Managers[mIdx], squad.ManagerId, now, 7);
         }
 
         return "{\"id\":" + squad.Id + ",\"valid\":true,\"personaId\":" + FutSquadPersonaId + ",\"formation\":\"" + squad.Formation +
@@ -3467,9 +3460,56 @@ internal sealed class WebServer
             ",\"manager\":[" + squadManager + "],\"players\":" + playersSb +
             ",\"actives\":" + actives + ",\"dreamSquad\":false,\"changed\":0,\"squadName\":\"" + Esc(squad.Name) + "\"," +
             "\"starRating\":" + rating + ",\"captain\":" + captainId + ",\"kicktakers\":" + kicktakers +
-            ",\"squadType\":\"REGULAR_SQUAD\",\"newSquad\":null,\"custom\":null}";
+            ",\"squadType\":\"REGULAR_SQUAD\",\"newsquad\":0,\"tactics\":[],\"custom\":null}";
     }
 
+
+    private static (string, string) RankedRoute(WebReq req, string path)
+    {
+        var ranked = RankedService.Current ?? throw new BadHttpRequestException("Ranked service unavailable.", 503);
+        long account = PlayerContext.Current.Id;
+        const string json = "application/json; charset=utf-8";
+        if (path.EndsWith("/ranked/self") && req.HttpMethod == "GET")
+            return (json, JsonSerializer.Serialize(new { rating = ranked.GetRating(account), activeMatch = ranked.GetActive(account) }));
+        if (path.EndsWith("/ranked/leaderboard") && req.HttpMethod == "GET")
+        {
+            int limit = int.TryParse(req.QueryString["count"], out int count) ? Math.Clamp(count, 1, 200) : 50;
+            int offset = int.TryParse(req.QueryString["start"], out int start) ? Math.Clamp(start, 0, ServerOptions.Current.Ranked.MaxPlayers) : 0;
+            return (json, JsonSerializer.Serialize(new { players = ranked.GetLeaderboard(limit, offset) }));
+        }
+        var pieces = path.TrimEnd('/').Split('/');
+        int index = Array.IndexOf(pieces, "ranked");
+        if (index < 0 || index + 1 >= pieces.Length || pieces[index + 1] != "match") throw new BadHttpRequestException("Unknown ranked route.", 404);
+        if (index + 2 == pieces.Length && req.HttpMethod == "GET") return (json, JsonSerializer.Serialize(new { match = ranked.GetActive(account) }));
+        if (index + 2 >= pieces.Length || !long.TryParse(pieces[index + 2], out long id) || id <= 0) throw new BadHttpRequestException("Missing ranked match identity.", 400);
+        try
+        {
+            if (index + 3 == pieces.Length && req.HttpMethod == "GET") return (json, JsonSerializer.Serialize(ranked.GetMatch(account, id)));
+            if (index + 4 != pieces.Length || pieces[index + 3] != "report" || req.HttpMethod is not ("POST" or "PUT"))
+                throw new BadHttpRequestException("Unsupported ranked operation.", 405);
+            using var document = JsonDocument.Parse(req.Body);
+            var body = document.RootElement;
+            bool forfeit = false;
+            if (body.TryGetProperty("forfeit", out var value))
+            {
+                if (value.ValueKind is not (JsonValueKind.True or JsonValueKind.False)) throw new BadHttpRequestException("Invalid forfeit value.", 400);
+                forfeit = value.GetBoolean();
+            }
+            int? goalsFor = null, goalsAgainst = null;
+            if (!forfeit)
+            {
+                if (!body.TryGetProperty("goalsFor", out var mine) || mine.ValueKind != JsonValueKind.Number || !mine.TryGetInt32(out int gf) ||
+                    !body.TryGetProperty("goalsAgainst", out var theirs) || theirs.ValueKind != JsonValueKind.Number || !theirs.TryGetInt32(out int ga))
+                    throw new BadHttpRequestException("Report both score values.", 400);
+                goalsFor = gf; goalsAgainst = ga;
+            }
+            var result = ranked.Report(account, id, goalsFor, goalsAgainst, forfeit);
+            RankedProjection.ApplyCurrent();
+            return (json, JsonSerializer.Serialize(new { result, credits = FutProfileStore.Get().Coins }));
+        }
+        catch (KeyNotFoundException) { throw new BadHttpRequestException("Unknown ranked match.", 404); }
+        catch (InvalidOperationException ex) { throw new BadHttpRequestException(ex.Message, 409); }
+    }
 
     private static string ClubVisualNode(string type, long resourceId)
     {
@@ -3497,7 +3537,7 @@ internal sealed class WebServer
         var item = ClubItems.Catalog.FirstOrDefault(c => c.ResourceId == resourceId);
         if (item.ResourceId != resourceId)
         {
-            Console.WriteLine($"[FUT] active {type} {resourceId} is not in the club item catalog");
+            ServerDiagnostics.Write($"[FUT] active {type} {resourceId} is not in the club item catalog");
             return "{}";
         }
 
@@ -3533,14 +3573,14 @@ internal sealed class WebServer
     // web identity matches the Blaze-authenticated persona.
     private const int SquadSlots = 23;
 
-    private const long FutSquadPersonaId = 0;
+    private static long FutSquadPersonaId => PlayerContext.Current.Id;
 
-    private const long BlazePersonaId = 1000;
-    private static readonly string BlazePersonaName = UserConfig.Username;
+    private static long BlazePersonaId => PlayerContext.Current.Id;
+    private static string BlazePersonaName => Esc(PlayerContext.Current.Name);
 
-    private const string SessionId = "FIFA14SERVERSESSION0000000000000";
+    private static string SessionId => PlayerContext.Session.Key;
 
-    private const string PowSid = "f1fa14f1fa14f1fa14f1fa14f1fa14f1fa14f1fa14f1fa14f1fa14f1fa14beef";
+    private static string PowSid => PlayerContext.Session.Key;
 
     private static long ParseLong(string s, long dflt) => long.TryParse(s, out var v) ? v : dflt;
 
@@ -3549,3 +3589,6 @@ internal sealed class WebServer
     private static string Esc(string s) => (s ?? "")
         .Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
 }
+
+internal sealed record HttpReply(int Status, string Type, byte[] Body, NameValueCollection Headers);
+internal sealed record CachedHttpReply(long Revision, long Second, HttpReply Reply);
